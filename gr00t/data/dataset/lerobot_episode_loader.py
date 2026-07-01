@@ -77,6 +77,42 @@ def _to_plain_dict(tree):
     return tree
 
 
+def _normalize_quaternions_wxyz(quaternions: np.ndarray) -> np.ndarray:
+    return quaternions / np.linalg.norm(quaternions, axis=-1, keepdims=True)
+
+
+def _conjugate_quaternions_wxyz(quaternions: np.ndarray) -> np.ndarray:
+    conjugated = quaternions.copy()
+    conjugated[..., 1:] *= -1
+    return conjugated
+
+
+def _multiply_quaternions_wxyz(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    w1, x1, y1, z1 = np.moveaxis(lhs, -1, 0)
+    w2, x2, y2, z2 = np.moveaxis(rhs, -1, 0)
+    return np.stack(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        axis=-1,
+    )
+
+
+def _first_frame_relative_quaternions_wxyz(quaternions: np.ndarray) -> np.ndarray:
+    quaternions = _normalize_quaternions_wxyz(quaternions.astype(np.float32))
+    first_inverse = _conjugate_quaternions_wxyz(quaternions[0])
+    relative_quaternions = _multiply_quaternions_wxyz(
+        np.broadcast_to(first_inverse, quaternions.shape), quaternions
+    )
+    relative_quaternions = _normalize_quaternions_wxyz(relative_quaternions)
+    relative_quaternions[relative_quaternions[:, 0] < 0] *= -1
+    relative_quaternions[0] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    return relative_quaternions
+
+
 class LeRobotEpisodeLoader:
     """
     Episode-level data loader for LeRobot format datasets.
@@ -322,6 +358,9 @@ class LeRobotEpisodeLoader:
         """
         modality_info = self.modality_meta.get(modality_type, {})
         joint_data = pd.DataFrame()
+        first_frame_relative_quaternion_keys = set(
+            self.modality_configs[modality_type].first_frame_relative_quaternion_keys or []
+        )
 
         for group_name in joint_groups:
             if group_name in modality_info:
@@ -334,6 +373,13 @@ class LeRobotEpisodeLoader:
                     joint_data[group_name] = df[original_key].map(lambda x: x[start_idx:end_idx])
                 else:
                     joint_data[group_name] = df[original_key]  # for strings and scalars
+                if group_name in first_frame_relative_quaternion_keys:
+                    quaternions = np.vstack(
+                        [np.asarray(x, dtype=np.float32) for x in joint_data[group_name]]
+                    )
+                    joint_data[group_name] = list(
+                        _first_frame_relative_quaternions_wxyz(quaternions)
+                    )
             else:
                 print(
                     f"Warning: Joint group '{group_name}' not found in {modality_type} modality. Available groups: {list(modality_info.keys())}"
@@ -496,6 +542,32 @@ class LeRobotEpisodeLoader:
 
         return mask_data
 
+    def _calculate_transformed_statistics(self, modality: str, joint_key: str) -> dict[str, list]:
+        all_values = []
+        for episode_meta in self.episodes_metadata:
+            episode_id = int(episode_meta["episode_index"])
+            nominal_length = int(episode_meta["length"])
+            episode_df = self._load_parquet_data(episode_id)
+            episode_df = episode_df.iloc[: min(len(episode_df), nominal_length)]
+            all_values.append(
+                np.vstack(
+                    [
+                        np.asarray(x, dtype=np.float32)
+                        for x in episode_df[f"{modality}.{joint_key}"]
+                    ]
+                )
+            )
+
+        values = np.concatenate(all_values, axis=0)
+        return {
+            "mean": np.mean(values, axis=0).tolist(),
+            "std": np.std(values, axis=0).tolist(),
+            "min": np.min(values, axis=0).tolist(),
+            "max": np.max(values, axis=0).tolist(),
+            "q01": np.quantile(values, 0.01, axis=0).tolist(),
+            "q99": np.quantile(values, 0.99, axis=0).tolist(),
+        }
+
     def get_dataset_statistics(self) -> dict[str, Any]:
         """
         Extract dataset statistics for normalization from loaded metadata.
@@ -511,7 +583,16 @@ class LeRobotEpisodeLoader:
         dataset_statistics = _rec_defaultdict()
 
         for modality in mapping.keys():  # state, action
+            first_frame_relative_quaternion_keys = set(
+                self.modality_configs[modality].first_frame_relative_quaternion_keys or []
+            )
             for joint_key in self.modality_configs[modality].modality_keys:
+                if joint_key in first_frame_relative_quaternion_keys:
+                    dataset_statistics[modality][joint_key] = (
+                        self._calculate_transformed_statistics(modality, joint_key)
+                    )
+                    continue
+
                 # Determine which statistics key to use
                 if self.modality_meta[modality][joint_key].get("original_key", None) is not None:
                     stats_key = self.modality_meta[modality][joint_key]["original_key"]

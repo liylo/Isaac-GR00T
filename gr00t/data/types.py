@@ -97,6 +97,8 @@ class ModalityConfig:
     """Optional list of keys to apply sin/cos encoding. If None or empty, use min/max normalization for all keys."""
     mean_std_embedding_keys: list[str] | None = None
     """Optional list of keys to apply mean/std normalization. If None or empty, use min/max normalization for all keys."""
+    first_frame_relative_quaternion_keys: list[str] | None = None
+    """Optional list of quaternion keys to express as rotation relative to the first frame of each episode."""
     action_configs: list[ActionConfig] | None = None
 
     def __post_init__(self):

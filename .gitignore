@@ -1,5 +1,7 @@
 # Test debug artifacts
 /debug_video_decoding/
+*output*
+checkpoints
 
 # Finetune datasets
 /examples/GR00T-WholeBodyControl/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim/
