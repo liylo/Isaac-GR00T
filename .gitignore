@@ -2,6 +2,7 @@
 /debug_video_decoding/
 *output*
 checkpoints
+*.png
 
 # Finetune datasets
 /examples/GR00T-WholeBodyControl/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim/

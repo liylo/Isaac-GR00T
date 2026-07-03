@@ -131,7 +131,7 @@ MODALITY_CONFIGS = {
             ],
         ),
         "action": ModalityConfig(
-            delta_indices=list(range(40)),
+            delta_indices=list(range(50)),
             modality_keys=[
                 "smpl_pose",
                 "body_quat_w",
