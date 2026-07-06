@@ -66,6 +66,7 @@ EMBODIMENT_TAG_TO_PROJECTOR_INDEX = {
     ##### Posttrain embodiment ids #####
     "unitree_g1_full_body_with_waist_height_nav_cmd": 25,
     "unitree_g1_sonic": 11,
+    "unitree_g1_sonic_human": 13,
     "unitree_g1_smpl": 12,
     "simpler_env_google": 0,
     "simpler_env_widowx": 1,

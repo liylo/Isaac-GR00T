@@ -16,6 +16,8 @@
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
+import tyro
+
 from gr00t.data.types import ModalityConfig
 
 from .embodiment_configs import MODALITY_CONFIGS
@@ -62,7 +64,9 @@ class DataConfig:
     # 2. Modality configs supplied through command line: --data.modality_configs (although rare and inconvenient)
     # 1 and 2 are unified through `config.data.modality_configs`.
     # 3. modality configs saved in the pretrained checkpoint.
-    modality_configs: dict[str, dict[str, ModalityConfig]] = field(
+    # Suppress tyro CLI parsing for the nested registry. The default contains
+    # ModalityConfig/ActionConfig objects that tyro 0.9.17 cannot introspect reliably.
+    modality_configs: tyro.conf.Suppress[dict[str, dict[str, ModalityConfig]]] = field(
         default_factory=lambda: MODALITY_CONFIGS
     )
 

@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
+
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import (
     ActionConfig,
@@ -300,6 +302,8 @@ MODALITY_CONFIGS = {
         ),
     },
 }
+
+MODALITY_CONFIGS["unitree_g1_sonic_human"] = deepcopy(MODALITY_CONFIGS["unitree_g1_sonic"])
 
 
 def register_modality_config(

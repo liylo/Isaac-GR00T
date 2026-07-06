@@ -18,17 +18,14 @@ import json
 from pathlib import Path
 from typing import List, Optional
 
+import tyro
 import yaml
 
 from gr00t.data.types import ActionConfig, ActionFormat, ActionRepresentation, ActionType
 
 from .data.data_config import DataConfig, SingleDatasetConfig
-from .model import create_model_union_type
 from .model.gr00t_n1d7 import Gr00tN1d7Config
 from .training.training_config import TrainingConfig
-
-
-ModelUnionType = create_model_union_type()
 
 
 @dataclass
@@ -36,7 +33,10 @@ class Config:
     """Complete configuration."""
 
     load_config_path: Optional[str] = None
-    model: ModelUnionType = field(default_factory=lambda: Gr00tN1d7Config())
+    # Suppress tyro CLI parsing for nested HuggingFace configs. tyro 0.9.17 can crash while
+    # introspecting Gr00tN1d7Config as a nested PretrainedConfig dataclass; YAML loading still
+    # instantiates the concrete config below.
+    model: tyro.conf.Suppress[Gr00tN1d7Config] = field(default_factory=lambda: Gr00tN1d7Config())
     data: DataConfig = field(default_factory=DataConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
 

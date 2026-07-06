@@ -48,6 +48,7 @@ class TestEmbodimentTagResolve:
             ("new_embodiment", EmbodimentTag.NEW_EMBODIMENT),
             ("NEW_EMBODIMENT", EmbodimentTag.NEW_EMBODIMENT),
             ("unitree_g1", EmbodimentTag.UNITREE_G1),
+            ("unitree_g1_sonic_human", EmbodimentTag.UNITREE_G1_SONIC_HUMAN),
             ("real_g1", EmbodimentTag.REAL_G1),
             # By enum value (various cases)
             ("libero_sim", EmbodimentTag.LIBERO_PANDA),

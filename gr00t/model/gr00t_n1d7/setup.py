@@ -65,10 +65,42 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             transformers_loading_kwargs["token"] = self.config.training.transformers_access_token
 
         self.transformers_loading_kwargs = transformers_loading_kwargs
+        self.config.model.model_name = self._resolve_backbone_model_name()
 
     @property
     def model_config(self):
         return self.config.model
+
+    def _resolve_backbone_model_name(self) -> str:
+        """Prefer a local backbone path recorded by the checkpoint processor config."""
+        model_name = str(self.config.model.model_name)
+        if Path(model_name).exists():
+            return model_name
+
+        checkpoint = self.config.training.start_from_checkpoint
+        if checkpoint is None:
+            return model_name
+
+        processor_config_path = Path(checkpoint) / "processor_config.json"
+        if not processor_config_path.is_file():
+            return model_name
+
+        try:
+            with open(processor_config_path) as f:
+                processor_config = json.load(f)
+        except Exception as exc:
+            logging.warning(f"Failed to read {processor_config_path}: {exc}")
+            return model_name
+
+        checkpoint_model_name = processor_config.get("processor_kwargs", {}).get("model_name")
+        if checkpoint_model_name and Path(str(checkpoint_model_name)).exists():
+            logging.info(
+                "Using local backbone model from checkpoint processor_config.json: "
+                f"{checkpoint_model_name}"
+            )
+            return str(checkpoint_model_name)
+
+        return model_name
 
     def setup(self):
         self.model = self._create_model()
@@ -86,6 +118,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 tune_projector=self.config.model.tune_projector,
                 tune_diffusion_model=self.config.model.tune_diffusion_model,
                 tune_vlln=self.config.model.tune_vlln,
+                model_name=self.config.model.model_name,
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
