@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 from gr00t.data.dataset.sharded_mixture_dataset import ShardedMixtureDataset, merge_statistics
 from gr00t.data.interfaces import ShardedDataset
 import numpy as np
+import pandas as pd
 
 
 # ---------------------------------------------------------------------------
@@ -317,3 +318,113 @@ class TestShardedSingleStepDataset:
 
         # effective = 50 - 8 + 1 = 43
         assert dataset.get_effective_episode_length(0) == 43
+
+    def test_per_key_action_offsets_and_reference_only_state(self):
+        from gr00t.data.dataset.sharded_single_step_dataset import extract_step_data
+        from gr00t.data.embodiment_tags import EmbodimentTag
+        from gr00t.data.types import (
+            ActionConfig,
+            ActionFormat,
+            ActionRepresentation,
+            ActionType,
+            ModalityConfig,
+        )
+
+        modality_configs = {
+            "video": ModalityConfig(delta_indices=[0], modality_keys=["cam"]),
+            "state": ModalityConfig(
+                delta_indices=[0],
+                modality_keys=["joints"],
+                reference_only_keys=["eef"],
+            ),
+            "action": ModalityConfig(
+                delta_indices=[0, 1],
+                modality_keys=["token", "eef"],
+                action_configs=[
+                    ActionConfig(
+                        ActionRepresentation.ABSOLUTE,
+                        ActionType.NON_EEF,
+                        ActionFormat.DEFAULT,
+                    ),
+                    ActionConfig(
+                        ActionRepresentation.RELATIVE,
+                        ActionType.EEF,
+                        ActionFormat.XYZ_ROT6D,
+                        state_key="eef",
+                        source_format=ActionFormat.XYZ_QUAT,
+                        delta_indices=[1, 2],
+                    ),
+                ],
+            ),
+            "language": ModalityConfig(delta_indices=[0], modality_keys=["task"]),
+        }
+        episode = pd.DataFrame(
+            {
+                "video.cam": [f"frame-{i}" for i in range(5)],
+                "state.joints": [np.array([i]) for i in range(5)],
+                "state.eef": [np.array([i] * 7) for i in range(5)],
+                "action.token": [np.array([i]) for i in range(5)],
+                "action.eef": [np.array([i] * 7) for i in range(5)],
+                "language.task": ["task"] * 5,
+            }
+        )
+        step = extract_step_data(
+            episode,
+            step_index=1,
+            modality_configs=modality_configs,
+            embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+        )
+        assert set(step.states) == {"joints", "eef"}
+        np.testing.assert_array_equal(step.actions["token"][:, 0], [1, 2])
+        np.testing.assert_array_equal(step.actions["eef"][:, 0], [2, 3])
+
+    def test_get_shard_uses_sparse_media_indices(self):
+        from gr00t.data.embodiment_tags import EmbodimentTag
+        from gr00t.data.types import ModalityConfig
+
+        modality_configs = {
+            "video": ModalityConfig(delta_indices=[-2, 0], modality_keys=["cam"]),
+            "state": ModalityConfig(delta_indices=[0], modality_keys=["x"]),
+            "action": ModalityConfig(delta_indices=list(range(4)), modality_keys=["x"]),
+            "language": ModalityConfig(delta_indices=[0], modality_keys=["task"]),
+        }
+
+        episode_df = pd.DataFrame(
+            {
+                "video.cam": [f"frame-{i}" for i in range(20)],
+                "state.x": [np.array([i], dtype=np.float32) for i in range(20)],
+                "action.x": [np.array([i], dtype=np.float32) for i in range(20)],
+                "language.task": ["task"] * 20,
+            }
+        )
+
+        with patch(
+            "gr00t.data.dataset.sharded_single_step_dataset.LeRobotEpisodeLoader"
+        ) as MockLoader:
+            mock_loader = MagicMock()
+            mock_loader.episode_lengths = [20]
+            mock_loader.get_episode_length = lambda idx: 20
+            mock_loader.load_episode_data.return_value = episode_df
+            MockLoader.return_value = mock_loader
+
+            from gr00t.data.dataset.sharded_single_step_dataset import ShardedSingleStepDataset
+
+            dataset = ShardedSingleStepDataset(
+                dataset_path="/fake/dataset",
+                embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+                modality_configs=modality_configs,
+                shard_size=1024,
+                episode_sampling_rate=1.0,
+                seed=42,
+            )
+
+        dataset.sharded_episodes = [[(0, np.array([0, 3, 5]))]]
+        dataset.shard_lengths = np.array([3])
+        dataset.set_processor(lambda messages: messages[0]["content"])
+
+        shard = dataset.get_shard(0)
+
+        assert len(shard) == 3
+        _, kwargs = mock_loader.load_episode_data.call_args
+        np.testing.assert_array_equal(kwargs["frame_indices"], np.array([0, 1, 3, 5, 18]))
+        assert kwargs["mask_indices"] is None

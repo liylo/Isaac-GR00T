@@ -23,9 +23,19 @@ Uses the same modality configs and statistics from the test fixtures directory
 import json
 from pathlib import Path
 
+from gr00t.data.state_action.action_chunking import EndEffectorActionChunk
+from gr00t.data.state_action.pose import EndEffectorPose
 from gr00t.data.state_action.state_action_processor import StateActionProcessor
+from gr00t.data.types import (
+    ActionConfig,
+    ActionFormat,
+    ActionRepresentation,
+    ActionType,
+    ModalityConfig,
+)
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 
 FIXTURE_DIR = Path(__file__).parent.parent.parent.parent / "fixtures" / "processor_config"
@@ -276,3 +286,308 @@ class TestTrainEvalMode:
         processor.eval()
         processor.train()
         assert processor.training is True
+
+
+class TestRelativeEefSourceFormat:
+    @staticmethod
+    def _absolute_pose(reference: EndEffectorPose, relative: EndEffectorPose) -> EndEffectorPose:
+        return EndEffectorPose(homogeneous=reference.homogeneous @ relative.homogeneous)
+
+    def test_all_targets_use_same_rotated_observation_frame(self):
+        reference = EndEffectorPose(
+            translation=[1.0, 2.0, 0.5],
+            rotation=Rotation.from_euler("z", 90, degrees=True).as_quat(),
+            rotation_type="quat",
+            rotation_order="xyzw",
+        )
+        relatives = [
+            EndEffectorPose(
+                translation=[0.2, 0.0, 0.1],
+                rotation=Rotation.from_euler("x", 20, degrees=True).as_quat(),
+                rotation_type="quat",
+                rotation_order="xyzw",
+            ),
+            EndEffectorPose(
+                translation=[0.4, -0.1, 0.2],
+                rotation=Rotation.from_euler("y", -30, degrees=True).as_quat(),
+                rotation_type="quat",
+                rotation_order="xyzw",
+            ),
+        ]
+        absolute = EndEffectorActionChunk(
+            [self._absolute_pose(reference, relative) for relative in relatives]
+        ).to(ActionFormat.XYZ_QUAT)
+
+        processor = StateActionProcessor(modality_configs={})
+        converted = processor._convert_to_relative_action(
+            absolute,
+            reference.xyz_quat_wxyz,
+            ActionType.EEF,
+            ActionFormat.XYZ_ROT6D,
+            source_format=ActionFormat.XYZ_QUAT,
+        )
+        expected = EndEffectorActionChunk(relatives).to(ActionFormat.XYZ_ROT6D)
+        np.testing.assert_allclose(converted, expected, atol=1e-6)
+
+        xyz_only = processor._convert_to_relative_action(
+            absolute,
+            reference.xyz_quat_wxyz,
+            ActionType.EEF,
+            ActionFormat.XYZ,
+            source_format=ActionFormat.XYZ_QUAT,
+        )
+        np.testing.assert_allclose(xyz_only, expected[:, :3], atol=1e-6)
+
+        adjacent_second = (
+            EndEffectorActionChunk.from_array(absolute, ActionFormat.XYZ_QUAT)
+            .delta_chunking()
+            .to(ActionFormat.XYZ_ROT6D)[1]
+        )
+        assert not np.allclose(converted[1], adjacent_second)
+
+        recovered = processor._convert_to_absolute_action(
+            converted,
+            reference.xyz_quat_wxyz,
+            ActionType.EEF,
+            ActionFormat.XYZ_ROT6D,
+            source_format=ActionFormat.XYZ_QUAT,
+        )
+        recovered_chunk = EndEffectorActionChunk.from_array(recovered, ActionFormat.XYZ_QUAT)
+        expected_chunk = EndEffectorActionChunk.from_array(absolute, ActionFormat.XYZ_QUAT)
+        for actual_pose, expected_pose in zip(recovered_chunk.poses, expected_chunk.poses):
+            np.testing.assert_allclose(
+                actual_pose.homogeneous, expected_pose.homogeneous, atol=1e-6
+            )
+
+    def test_reference_only_state_and_fixed_action_slot(self):
+        tag = "eef_test"
+        modality_configs = {
+            tag: {
+                "state": ModalityConfig(
+                    delta_indices=[0],
+                    modality_keys=["joints"],
+                    reference_only_keys=["eef"],
+                ),
+                "action": ModalityConfig(
+                    delta_indices=[0, 1],
+                    modality_keys=["eef"],
+                    action_configs=[
+                        ActionConfig(
+                            rep=ActionRepresentation.RELATIVE,
+                            type=ActionType.EEF,
+                            format=ActionFormat.XYZ_ROT6D,
+                            source_format=ActionFormat.XYZ_QUAT,
+                            state_key="eef",
+                            delta_indices=[1, 2],
+                            model_offset=78,
+                        )
+                    ],
+                ),
+            }
+        }
+
+        def scalar_stats(dim):
+            return {
+                name: [value] * dim
+                for name, value in {
+                    "mean": 0.0,
+                    "std": 1.0,
+                    "min": -2.0,
+                    "max": 2.0,
+                    "q01": -2.0,
+                    "q99": 2.0,
+                }.items()
+            }
+
+        statistics = {
+            tag: {
+                "state": {"joints": scalar_stats(2)},
+                "action": {"eef": scalar_stats(7)},
+                "relative_action": {"eef": scalar_stats(9)},
+            }
+        }
+        processor = StateActionProcessor(
+            modality_configs=modality_configs,
+            statistics=statistics,
+            use_relative_action=True,
+            clip_outliers=False,
+        )
+        states = {
+            "joints": np.array([[0.1, -0.2]], dtype=np.float32),
+            "eef": np.array([[0, 0, 0, 1, 0, 0, 0]], dtype=np.float32),
+        }
+        actions = {
+            "eef": np.array(
+                [[0.1, 0, 0, 1, 0, 0, 0], [0.2, 0, 0, 1, 0, 0, 0]],
+                dtype=np.float32,
+            )
+        }
+        normalized_state, normalized_action = processor.apply(states, actions, tag)
+        assert set(normalized_state) == {"joints"}
+        assert normalized_action["eef"].shape == (2, 9)
+        assert processor.get_action_slices(tag) == {"eef": (78, 87)}
+        assert processor.get_action_dim(tag) == 87
+
+    def test_xyz_only_slices_full_pose_stats_and_uses_three_model_dims(self):
+        tag = "eef_xyz_only_test"
+
+        def scalar_stats(dim):
+            return {
+                name: [value] * dim
+                for name, value in {
+                    "mean": 0.0,
+                    "std": 1.0,
+                    "min": -2.0,
+                    "max": 2.0,
+                    "q01": -2.0,
+                    "q99": 2.0,
+                }.items()
+            }
+
+        config = {
+            tag: {
+                "state": ModalityConfig(
+                    delta_indices=[0],
+                    modality_keys=["joints"],
+                    reference_only_keys=["eef"],
+                ),
+                "action": ModalityConfig(
+                    delta_indices=[0, 1],
+                    modality_keys=["eef"],
+                    action_configs=[
+                        ActionConfig(
+                            rep=ActionRepresentation.RELATIVE,
+                            type=ActionType.EEF,
+                            format=ActionFormat.XYZ,
+                            source_format=ActionFormat.XYZ_QUAT,
+                            state_key="eef",
+                            delta_indices=[1, 2],
+                            model_offset=78,
+                            decode_to_absolute=False,
+                        )
+                    ],
+                ),
+            }
+        }
+        processor = StateActionProcessor(
+            modality_configs=config,
+            statistics={
+                tag: {
+                    "state": {"joints": scalar_stats(2)},
+                    "action": {"eef": scalar_stats(7)},
+                    # Existing datasets store xyz+rot6d stats. XYZ-only mode
+                    # reuses their first three dimensions exactly.
+                    "relative_action": {"eef": scalar_stats(9)},
+                }
+            },
+            use_relative_action=True,
+            clip_outliers=False,
+        )
+        states = {
+            "joints": np.array([[0.1, -0.2]], dtype=np.float32),
+            "eef": np.array([[0, 0, 0, 1, 0, 0, 0]], dtype=np.float32),
+        }
+        actions = {
+            "eef": np.array(
+                [[0.1, 0, 0, 1, 0, 0, 0], [0.2, 0, 0, 1, 0, 0, 0]],
+                dtype=np.float32,
+            )
+        }
+        normalized_state, normalized_action = processor.apply(states, actions, tag)
+        assert set(normalized_state) == {"joints"}
+        assert normalized_action["eef"].shape == (2, 3)
+        assert processor.get_action_slices(tag) == {"eef": (78, 81)}
+        assert processor.get_action_dim(tag) == 81
+        assert processor.unapply_action(normalized_action, tag)["eef"].shape == (2, 3)
+
+    def test_extended_action_config_json_roundtrip(self):
+        from gr00t.data.utils import parse_modality_configs, to_json_serializable
+
+        config = {
+            "eef_test": {
+                "state": ModalityConfig(
+                    delta_indices=[0],
+                    modality_keys=["joints"],
+                    reference_only_keys=["eef"],
+                ),
+                "action": ModalityConfig(
+                    delta_indices=[0, 1],
+                    modality_keys=["eef"],
+                    action_configs=[
+                        ActionConfig(
+                            rep=ActionRepresentation.RELATIVE,
+                            type=ActionType.EEF,
+                            format=ActionFormat.XYZ_ROT6D,
+                            source_format=ActionFormat.XYZ_QUAT,
+                            state_key="eef",
+                            delta_indices=[1, 2],
+                            model_offset=78,
+                            loss_weight=2.5,
+                            decode_to_absolute=False,
+                            is_auxiliary=True,
+                        )
+                    ],
+                ),
+            }
+        }
+
+        parsed = parse_modality_configs(to_json_serializable(config))
+        state_config = parsed["eef_test"]["state"]
+        action_config = parsed["eef_test"]["action"].action_configs[0]
+        assert state_config.reference_only_keys == ["eef"]
+        assert action_config.source_format is ActionFormat.XYZ_QUAT
+        assert action_config.delta_indices == [1, 2]
+        assert action_config.model_offset == 78
+        assert action_config.loss_weight == 2.5
+        assert action_config.decode_to_absolute is False
+        assert action_config.is_auxiliary is True
+
+    def test_relative_output_decodes_without_reference_state(self):
+        tag = "relative_output_test"
+        stats = {
+            name: [value] * 9
+            for name, value in {
+                "mean": 0.0,
+                "std": 1.0,
+                "min": -1.0,
+                "max": 1.0,
+                "q01": -1.0,
+                "q99": 1.0,
+            }.items()
+        }
+        processor = StateActionProcessor(
+            modality_configs={
+                tag: {
+                    "state": ModalityConfig(delta_indices=[0], modality_keys=["joints"]),
+                    "action": ModalityConfig(
+                        delta_indices=[0, 1],
+                        modality_keys=["eef"],
+                        action_configs=[
+                            ActionConfig(
+                                rep=ActionRepresentation.RELATIVE,
+                                type=ActionType.EEF,
+                                format=ActionFormat.XYZ_ROT6D,
+                                decode_to_absolute=False,
+                            )
+                        ],
+                    ),
+                }
+            },
+            statistics={
+                tag: {
+                    "action": {"eef": stats},
+                    "relative_action": {"eef": stats},
+                }
+            },
+            use_relative_action=True,
+            clip_outliers=False,
+        )
+        relative_action = np.array(
+            [
+                [0.1, 0.2, 0.3, 1, 0, 0, 0, 1, 0],
+                [0.4, 0.5, 0.6, 1, 0, 0, 0, 1, 0],
+            ],
+            dtype=np.float32,
+        )
+        decoded = processor.unapply_action({"eef": relative_action}, tag, state=None)
+        np.testing.assert_allclose(decoded["eef"], relative_action, atol=1e-6)

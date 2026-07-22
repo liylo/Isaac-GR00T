@@ -108,6 +108,12 @@ class Gr00tN1d7Config(PretrainedConfig):
     noise_s: float = 0.999
     num_timestep_buckets: int = 1000
 
+    # Auxiliary EEF flow branch. The branch has task-specific action input/output
+    # adapters while sharing the state/context representation and DiT trunk.
+    auxiliary_action_loss_weight: float = 0.5
+    auxiliary_action_init_category: int = 11
+    action_branch_mode: str = "primary"  # primary, eef, or primary_eef
+
     # Training parameters
     tune_projector: bool = True
     tune_diffusion_model: bool = True

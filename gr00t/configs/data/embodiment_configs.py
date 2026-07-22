@@ -306,6 +306,147 @@ MODALITY_CONFIGS = {
 MODALITY_CONFIGS["unitree_g1_sonic_human"] = deepcopy(MODALITY_CONFIGS["unitree_g1_sonic"])
 
 
+_SONIC_TOKEN_ACTION_CONFIGS = [
+    ActionConfig(
+        rep=ActionRepresentation.ABSOLUTE,
+        type=ActionType.NON_EEF,
+        format=ActionFormat.DEFAULT,
+        model_offset=0,
+    ),
+    ActionConfig(
+        rep=ActionRepresentation.ABSOLUTE,
+        type=ActionType.NON_EEF,
+        format=ActionFormat.DEFAULT,
+        model_offset=64,
+    ),
+    ActionConfig(
+        rep=ActionRepresentation.ABSOLUTE,
+        type=ActionType.NON_EEF,
+        format=ActionFormat.DEFAULT,
+        model_offset=71,
+    ),
+]
+
+
+def _eef_action_config(
+    key: str,
+    model_offset: int,
+    delta_indices: list[int],
+) -> ActionConfig:
+    return ActionConfig(
+        rep=ActionRepresentation.RELATIVE,
+        type=ActionType.EEF,
+        format=ActionFormat.XYZ_ROT6D,
+        source_format=ActionFormat.XYZ_QUAT,
+        state_key=key,
+        delta_indices=delta_indices,
+        model_offset=model_offset,
+        decode_to_absolute=False,
+        is_auxiliary=True,
+    )
+
+
+def _register_sonic_endpose_config(
+    tag: str,
+    endpose_keys: list[str],
+    include_token: bool,
+    endpose_delta_indices: list[int],
+) -> None:
+    config = deepcopy(MODALITY_CONFIGS["unitree_g1_sonic"])
+    config["state"].reference_only_keys = list(endpose_keys)
+
+    action_keys = []
+    action_configs = []
+    if include_token:
+        action_keys.extend(["motion_token", "left_hand_joints", "right_hand_joints"])
+        action_configs.extend(deepcopy(_SONIC_TOKEN_ACTION_CONFIGS))
+    action_keys.extend(endpose_keys)
+    action_configs.extend(
+        _eef_action_config(
+            key,
+            model_offset=78 + 9 * index,
+            delta_indices=endpose_delta_indices,
+        )
+        for index, key in enumerate(endpose_keys)
+    )
+    config["action"] = ModalityConfig(
+        delta_indices=list(range(40)),
+        modality_keys=action_keys,
+        action_configs=action_configs,
+    )
+    MODALITY_CONFIGS[tag] = config
+
+
+def enable_sonic_endpose_xyz_only(config: dict[str, ModalityConfig]) -> None:
+    """Keep EEF frame conversion but supervise only its relative xyz translation.
+
+    EEF model offsets retain their 9D-lane spacing so xyz-only and full-pose
+    checkpoints agree on the semantic location of every limb. Token and EEF
+    losses are normalized independently by the model.
+    """
+    action_config = config.get("action")
+    if action_config is None or action_config.action_configs is None:
+        raise ValueError("endpose_xyz_only requires explicit action configs")
+
+    eef_configs = [
+        item for item in action_config.action_configs if item.type == ActionType.EEF
+    ]
+    if not eef_configs:
+        raise ValueError("endpose_xyz_only requires at least one EEF action")
+    for item in eef_configs:
+        if item.source_format is None:
+            raise ValueError("endpose_xyz_only requires each EEF action to define source_format")
+        item.format = ActionFormat.XYZ
+        item.decode_to_absolute = False
+
+
+
+_register_sonic_endpose_config(
+    "unitree_g1_sonic_endpose",
+    [
+        "left_wrist_endpose",
+        "right_wrist_endpose",
+        "left_foot_endpose",
+        "right_foot_endpose",
+    ],
+    include_token=False,
+    endpose_delta_indices=list(range(1, 41)),
+)
+_register_sonic_endpose_config(
+    "unitree_g1_sonic_token_endpose",
+    [
+        "left_wrist_endpose",
+        "right_wrist_endpose",
+        "left_foot_endpose",
+        "right_foot_endpose",
+    ],
+    include_token=True,
+    endpose_delta_indices=list(range(1, 41)),
+)
+_register_sonic_endpose_config(
+    "unitree_g1_sonic_human_endpose",
+    [
+        "human_left_hand_endpose",
+        "human_right_hand_endpose",
+        "human_left_foot_endpose",
+        "human_right_foot_endpose",
+    ],
+    include_token=False,
+    endpose_delta_indices=list(range(1, 41)),
+)
+_register_sonic_endpose_config(
+    "unitree_g1_sonic_human_token_endpose",
+    [
+        "human_left_hand_endpose",
+        "human_right_hand_endpose",
+        "human_left_foot_endpose",
+        "human_right_foot_endpose",
+    ],
+    include_token=True,
+    endpose_delta_indices=list(range(1, 41)),
+)
+
+
 def register_modality_config(
     config: dict, embodiment_tag: EmbodimentTag = EmbodimentTag.NEW_EMBODIMENT
 ):

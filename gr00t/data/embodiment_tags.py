@@ -43,6 +43,10 @@ class EmbodimentTag(Enum):
     - UNITREE_G1           -> "unitree_g1_full_body_with_waist_height_nav_cmd"
     - UNITREE_G1_SONIC     -> "unitree_g1_sonic"
     - UNITREE_G1_SONIC_HUMAN -> "unitree_g1_sonic_human"
+    - UNITREE_G1_SONIC_ENDPOSE -> "unitree_g1_sonic_endpose"
+    - UNITREE_G1_SONIC_TOKEN_ENDPOSE -> "unitree_g1_sonic_token_endpose"
+    - UNITREE_G1_SONIC_HUMAN_ENDPOSE -> "unitree_g1_sonic_human_endpose"
+    - UNITREE_G1_SONIC_HUMAN_TOKEN_ENDPOSE -> "unitree_g1_sonic_human_token_endpose"
     - UNITREE_G1_SMPL      -> "unitree_g1_smpl"
     - SIMPLER_ENV_GOOGLE   -> "simpler_env_google"
     - SIMPLER_ENV_WIDOWX   -> "simpler_env_widowx"
@@ -113,6 +117,18 @@ class EmbodimentTag(Enum):
     """
     Human demonstrations using the Unitree G1 SONIC data/action format.
     """
+
+    UNITREE_G1_SONIC_ENDPOSE = "unitree_g1_sonic_endpose"
+    """Unitree G1 observations with relative wrist and ankle end-pose targets."""
+
+    UNITREE_G1_SONIC_TOKEN_ENDPOSE = "unitree_g1_sonic_token_endpose"
+    """Unitree G1 SONIC token/hand actions plus relative wrist and ankle targets."""
+
+    UNITREE_G1_SONIC_HUMAN_ENDPOSE = "unitree_g1_sonic_human_endpose"
+    """Human observations with relative hand/foot end-pose targets."""
+
+    UNITREE_G1_SONIC_HUMAN_TOKEN_ENDPOSE = "unitree_g1_sonic_human_token_endpose"
+    """Human SONIC token/hand actions plus relative hand/foot end-pose targets."""
 
     UNITREE_G1_SMPL = "unitree_g1_smpl"
     """
@@ -206,6 +222,10 @@ POSTTRAIN_TAGS: frozenset[EmbodimentTag] = frozenset(
         EmbodimentTag.UNITREE_G1,
         EmbodimentTag.UNITREE_G1_SONIC,
         EmbodimentTag.UNITREE_G1_SONIC_HUMAN,
+        EmbodimentTag.UNITREE_G1_SONIC_ENDPOSE,
+        EmbodimentTag.UNITREE_G1_SONIC_TOKEN_ENDPOSE,
+        EmbodimentTag.UNITREE_G1_SONIC_HUMAN_ENDPOSE,
+        EmbodimentTag.UNITREE_G1_SONIC_HUMAN_TOKEN_ENDPOSE,
         EmbodimentTag.UNITREE_G1_SMPL,
         EmbodimentTag.SIMPLER_ENV_GOOGLE,
         EmbodimentTag.SIMPLER_ENV_WIDOWX,

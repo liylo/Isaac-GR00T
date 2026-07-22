@@ -28,6 +28,100 @@ from scipy.spatial.transform import Rotation
 PoseT = TypeVar("PoseT", bound="Pose")
 
 
+def _pose_arrays_to_matrices(
+    poses: np.ndarray, action_format: ActionFormat
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized conversion from flat EEF poses to translations and rotations."""
+    poses = np.asarray(poses, dtype=np.float64)
+    if poses.ndim != 2:
+        raise ValueError(f"Expected pose array with shape (N, D), got {poses.shape}")
+    translations = poses[:, :3]
+    rotations = poses[:, 3:]
+    if action_format == ActionFormat.XYZ_QUAT:
+        matrices = Rotation.from_quat(rotations[:, [1, 2, 3, 0]]).as_matrix()
+    elif action_format == ActionFormat.XYZ_ROTVEC:
+        matrices = Rotation.from_rotvec(rotations).as_matrix()
+    elif action_format == ActionFormat.XYZ_ROT6D:
+        rows = rotations.reshape(-1, 2, 3)
+        row1 = rows[:, 0]
+        row1 = row1 / np.maximum(np.linalg.norm(row1, axis=1, keepdims=True), 1e-12)
+        row2 = rows[:, 1] - np.sum(row1 * rows[:, 1], axis=1, keepdims=True) * row1
+        row2 = row2 / np.maximum(np.linalg.norm(row2, axis=1, keepdims=True), 1e-12)
+        matrices = np.stack([row1, row2, np.cross(row1, row2)], axis=1)
+    else:
+        raise ValueError(f"Vectorized EEF conversion does not support {action_format}")
+    return translations, matrices
+
+
+def _matrices_to_pose_arrays(
+    translations: np.ndarray,
+    matrices: np.ndarray,
+    action_format: ActionFormat,
+) -> np.ndarray:
+    """Vectorized conversion from translations/rotation matrices to flat EEF poses."""
+    if action_format == ActionFormat.XYZ:
+        return translations
+    if action_format == ActionFormat.XYZ_ROT6D:
+        rotations = matrices[:, :2, :].reshape(-1, 6)
+    elif action_format == ActionFormat.XYZ_ROTVEC:
+        rotations = Rotation.from_matrix(matrices).as_rotvec()
+    elif action_format == ActionFormat.XYZ_QUAT:
+        rotations = Rotation.from_matrix(matrices).as_quat()[:, [3, 0, 1, 2]]
+        rotations[rotations[:, 0] < 0] *= -1
+    else:
+        raise ValueError(f"Vectorized EEF conversion does not support {action_format}")
+    return np.concatenate([translations, rotations], axis=1)
+
+
+def relative_eef_pose_array(
+    poses: np.ndarray,
+    reference_poses: np.ndarray,
+    source_format: ActionFormat,
+    output_format: ActionFormat,
+) -> np.ndarray:
+    """Express every pose in its paired observation pose frame."""
+    translations, rotations = _pose_arrays_to_matrices(poses, source_format)
+    references = np.asarray(reference_poses, dtype=np.float64)
+    if references.ndim == 1:
+        references = np.broadcast_to(references, (poses.shape[0], references.shape[0]))
+    if references.shape[0] != poses.shape[0]:
+        raise ValueError(
+            f"Pose/reference batch mismatch: {poses.shape[0]} vs {references.shape[0]}"
+        )
+    reference_translations, reference_rotations = _pose_arrays_to_matrices(
+        references, source_format
+    )
+    reference_inverse = np.swapaxes(reference_rotations, 1, 2)
+    relative_translations = np.einsum(
+        "nij,nj->ni", reference_inverse, translations - reference_translations
+    )
+    relative_rotations = np.einsum("nij,njk->nik", reference_inverse, rotations)
+    return _matrices_to_pose_arrays(relative_translations, relative_rotations, output_format)
+
+
+def compose_eef_pose_array(
+    relative_poses: np.ndarray,
+    reference_poses: np.ndarray,
+    relative_format: ActionFormat,
+    output_format: ActionFormat,
+) -> np.ndarray:
+    """Compose paired relative poses onto observation poses."""
+    relative_translations, relative_rotations = _pose_arrays_to_matrices(
+        relative_poses, relative_format
+    )
+    references = np.asarray(reference_poses, dtype=np.float64)
+    if references.ndim == 1:
+        references = np.broadcast_to(references, (relative_poses.shape[0], references.shape[0]))
+    reference_translations, reference_rotations = _pose_arrays_to_matrices(
+        references, output_format
+    )
+    absolute_translations = reference_translations + np.einsum(
+        "nij,nj->ni", reference_rotations, relative_translations
+    )
+    absolute_rotations = np.einsum("nij,njk->nik", reference_rotations, relative_rotations)
+    return _matrices_to_pose_arrays(absolute_translations, absolute_rotations, output_format)
+
+
 def invert_transformation(T: NDArray[np.float64]) -> NDArray[np.float64]:
     """
     Invert a homogeneous transformation matrix.
@@ -558,6 +652,14 @@ class EndEffectorPose(Pose):
         return np.concatenate([self._translation, self.rotvec])
 
     @property
+    def xyz_quat_wxyz(self) -> np.ndarray:
+        """Get pose as translation plus a canonical scalar-first quaternion (7,)."""
+        quat = self.quat_wxyz
+        if quat[0] < 0:
+            quat = -quat
+        return np.concatenate([self._translation, quat])
+
+    @property
     def homogeneous(self) -> np.ndarray:
         """
         Get homogeneous transformation matrix.
@@ -695,6 +797,13 @@ class EndEffectorPose(Pose):
             return cls(translation=data[:3], rotation=data[3:], rotation_type="rot6d")
         elif action_format == ActionFormat.XYZ_ROTVEC:
             return cls(translation=data[:3], rotation=data[3:], rotation_type="rotvec")
+        elif action_format == ActionFormat.XYZ_QUAT:
+            return cls(
+                translation=data[:3],
+                rotation=data[3:],
+                rotation_type="quat",
+                rotation_order="wxyz",
+            )
         elif action_format == ActionFormat.DEFAULT:
             return cls(homogeneous=data.reshape(4, 4))
         else:

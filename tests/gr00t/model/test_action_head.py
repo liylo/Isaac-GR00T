@@ -97,6 +97,17 @@ def _make_action_input(config, batch_size=2):
     )
 
 
+def _has_nonzero_grad(module) -> bool:
+    return any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in module.parameters()
+    )
+
+
+def _has_any_grad(module) -> bool:
+    return any(parameter.grad is not None for parameter in module.parameters())
+
+
 class TestActionHeadForward:
     """Test training forward pass."""
 
@@ -150,6 +161,63 @@ class TestActionHeadGetAction:
         )
         assert out["action_pred"].shape[0] == 1
 
+    def test_combined_inference_keeps_auxiliary_slots_zero(self):
+        config = _small_config(action_branch_mode="primary_eef")
+        head = Gr00tN1d7ActionHead(config)
+        head.eval()
+        action_input = _make_action_input(config)
+        del action_input["action"]
+        primary_mask = torch.zeros_like(action_input.action_mask)
+        primary_mask[..., :4] = 1.0
+        action_input["primary_action_mask"] = primary_mask
+        encoded_trajectories = []
+        hook = head.action_encoder.register_forward_pre_hook(
+            lambda _module, args: encoded_trajectories.append(args[0].detach().clone())
+        )
+        try:
+            output = head.get_action(_make_backbone_output(config), action_input)
+        finally:
+            hook.remove()
+
+        assert encoded_trajectories
+        assert all(torch.count_nonzero(value[..., 4:]) == 0 for value in encoded_trajectories)
+        assert torch.count_nonzero(output["action_pred"][..., 4:]) == 0
+
+    def test_combined_inference_requires_primary_mask(self):
+        config = _small_config(action_branch_mode="primary_eef")
+        head = Gr00tN1d7ActionHead(config)
+        action_input = _make_action_input(config)
+        del action_input["action"]
+        with pytest.raises(RuntimeError, match="requires primary_action_mask"):
+            head.get_action(_make_backbone_output(config), action_input)
+
+    def test_combined_rtc_keeps_auxiliary_slots_zero(self):
+        config = _small_config(action_branch_mode="primary_eef")
+        head = Gr00tN1d7ActionHead(config)
+        action_input = _make_action_input(config)
+        primary_mask = torch.zeros_like(action_input.action_mask)
+        primary_mask[..., :4] = 1.0
+        action_input["primary_action_mask"] = primary_mask
+        output = head.get_action(
+            _make_backbone_output(config),
+            action_input,
+            options={
+                "action_horizon": config.action_horizon,
+                "rtc_overlap_steps": 2,
+                "rtc_frozen_steps": 1,
+                "rtc_ramp_rate": 1.0,
+            },
+        )
+        assert torch.count_nonzero(output["action_pred"][..., 4:]) == 0
+
+    def test_eef_only_checkpoint_has_no_policy_action(self):
+        config = _small_config(action_branch_mode="eef")
+        head = Gr00tN1d7ActionHead(config)
+        action_input = _make_action_input(config)
+        del action_input["action"]
+        with pytest.raises(RuntimeError, match="training supervision"):
+            head.get_action(_make_backbone_output(config), action_input)
+
 
 class TestActionHeadEncodeFeatures:
     """Test feature encoding helper."""
@@ -187,3 +255,196 @@ class TestActionHeadTrainableParams:
         head.set_trainable_parameters(True, False, True)
         for p in head.model.parameters():
             assert not p.requires_grad
+
+
+class TestAuxiliaryEefBranch:
+    """EEF has task-specific I/O adapters but shares the DiT trunk."""
+
+    @staticmethod
+    def _set_branch_masks(action_input, primary_dims: int, include_primary: bool, include_eef: bool):
+        action_mask = torch.zeros_like(action_input.action_mask)
+        auxiliary_mask = torch.zeros_like(action_input.action_mask)
+        if include_primary:
+            action_mask[..., :primary_dims] = 1.0
+        if include_eef:
+            action_mask[..., primary_dims:] = 1.0
+            auxiliary_mask[..., primary_dims:] = 1.0
+        action_input["action_mask"] = action_mask
+        action_input["auxiliary_action_mask"] = auxiliary_mask
+        return action_input
+
+    def test_eef_only_freezes_and_skips_primary_adapters(self):
+        config = _small_config(action_branch_mode="eef", auxiliary_action_init_category=0)
+        head = Gr00tN1d7ActionHead(config)
+        head.train()
+        action_input = self._set_branch_masks(
+            _make_action_input(config), primary_dims=4, include_primary=False, include_eef=True
+        )
+        primary_calls = []
+        encoder_hook = head.action_encoder.register_forward_hook(
+            lambda *_args: primary_calls.append("encoder")
+        )
+        decoder_hook = head.action_decoder.register_forward_hook(
+            lambda *_args: primary_calls.append("decoder")
+        )
+        try:
+            output = head(_make_backbone_output(config), action_input)
+            output["loss"].backward()
+        finally:
+            encoder_hook.remove()
+            decoder_hook.remove()
+
+        assert primary_calls == []
+        assert not any(parameter.requires_grad for parameter in head.action_encoder.parameters())
+        assert not any(parameter.requires_grad for parameter in head.action_decoder.parameters())
+        assert not _has_any_grad(head.action_encoder)
+        assert not _has_any_grad(head.action_decoder)
+        assert _has_nonzero_grad(head.eef_action_encoder)
+        assert _has_nonzero_grad(head.eef_action_decoder)
+        assert _has_nonzero_grad(head.model)
+
+    def test_primary_only_skips_eef_adapters(self):
+        config = _small_config(action_branch_mode="primary_eef")
+        head = Gr00tN1d7ActionHead(config)
+        head.train()
+        action_input = self._set_branch_masks(
+            _make_action_input(config), primary_dims=4, include_primary=True, include_eef=False
+        )
+        eef_calls = []
+        primary_inputs = []
+        primary_hook = head.action_encoder.register_forward_pre_hook(
+            lambda _module, args: primary_inputs.append(args[0].detach().clone())
+        )
+        encoder_hook = head.eef_action_encoder.register_forward_hook(
+            lambda *_args: eef_calls.append("encoder")
+        )
+        decoder_hook = head.eef_action_decoder.register_forward_hook(
+            lambda *_args: eef_calls.append("decoder")
+        )
+        try:
+            output = head(_make_backbone_output(config), action_input)
+            output["loss"].backward()
+        finally:
+            primary_hook.remove()
+            encoder_hook.remove()
+            decoder_hook.remove()
+
+        assert eef_calls == []
+        assert len(primary_inputs) == 1
+        assert torch.count_nonzero(primary_inputs[0][..., 4:]) == 0
+        assert _has_nonzero_grad(head.action_encoder)
+        assert _has_nonzero_grad(head.action_decoder)
+        assert not _has_any_grad(head.eef_action_encoder)
+        assert not _has_any_grad(head.eef_action_decoder)
+        assert _has_nonzero_grad(head.model)
+
+    def test_eef_only_batch_in_combined_mode_skips_primary_adapters(self):
+        config = _small_config(action_branch_mode="primary_eef")
+        head = Gr00tN1d7ActionHead(config)
+        head.train()
+        action_input = self._set_branch_masks(
+            _make_action_input(config), primary_dims=4, include_primary=False, include_eef=True
+        )
+        output = head(_make_backbone_output(config), action_input)
+        output["loss"].backward()
+
+        # The modules stay trainable for a later primary batch, but this batch
+        # must leave grad=None so AdamW cannot decay them.
+        assert all(parameter.requires_grad for parameter in head.action_encoder.parameters())
+        assert all(parameter.requires_grad for parameter in head.action_decoder.parameters())
+        assert not _has_any_grad(head.action_encoder)
+        assert not _has_any_grad(head.action_decoder)
+        assert _has_nonzero_grad(head.eef_action_encoder)
+        assert _has_nonzero_grad(head.eef_action_decoder)
+        assert _has_nonzero_grad(head.model)
+
+    def test_combined_updates_both_adapters_and_shared_dit(self):
+        config = _small_config(action_branch_mode="primary_eef")
+        head = Gr00tN1d7ActionHead(config)
+        head.train()
+        action_input = self._set_branch_masks(
+            _make_action_input(config), primary_dims=4, include_primary=True, include_eef=True
+        )
+        output = head(_make_backbone_output(config), action_input)
+        output["loss"].backward()
+
+        assert _has_nonzero_grad(head.action_encoder)
+        assert _has_nonzero_grad(head.action_decoder)
+        assert _has_nonzero_grad(head.eef_action_encoder)
+        assert _has_nonzero_grad(head.eef_action_decoder)
+        assert _has_nonzero_grad(head.model)
+
+    def test_combined_losses_are_normalized_separately(self):
+        config = _small_config(
+            action_branch_mode="primary_eef", auxiliary_action_loss_weight=0.25
+        )
+        head = Gr00tN1d7ActionHead(config)
+        head.train()
+        action_input = self._set_branch_masks(
+            _make_action_input(config), primary_dims=4, include_primary=True, include_eef=True
+        )
+        # Make the masks deliberately unequal and non-unit weighted.
+        action_input.action_mask[..., :4] = 0.5
+        action_input.action_mask[:, :2, 4:] = 0.0
+        output = head(_make_backbone_output(config), action_input)
+
+        auxiliary_selector = action_input.auxiliary_action_mask
+        auxiliary_mask = action_input.action_mask * auxiliary_selector
+        primary_mask = action_input.action_mask * (1 - auxiliary_selector)
+        expected_primary = (
+            (output["action_loss"] * (primary_mask > 0)).sum()
+            / (primary_mask.sum() + 1e-6)
+        )
+        expected_auxiliary = (
+            (output["action_loss"] * (auxiliary_mask > 0)).sum()
+            / (auxiliary_mask.sum() + 1e-6)
+        )
+        torch.testing.assert_close(output["primary_loss"], expected_primary)
+        torch.testing.assert_close(output["auxiliary_loss"], expected_auxiliary)
+        torch.testing.assert_close(
+            output["loss"], expected_primary + 0.25 * expected_auxiliary
+        )
+
+    @pytest.mark.parametrize(
+        ("branch_mode", "include_primary", "include_eef", "message"),
+        [
+            ("eef", True, False, "EEF-only branch mode"),
+            ("primary", False, True, "Primary-only branch mode"),
+        ],
+    )
+    def test_branch_mode_rejects_mismatched_supervision(
+        self, branch_mode, include_primary, include_eef, message
+    ):
+        config = _small_config(action_branch_mode=branch_mode)
+        head = Gr00tN1d7ActionHead(config)
+        action_input = self._set_branch_masks(
+            _make_action_input(config),
+            primary_dims=4,
+            include_primary=include_primary,
+            include_eef=include_eef,
+        )
+        with pytest.raises(ValueError, match=message):
+            head(_make_backbone_output(config), action_input)
+
+    def test_eef_branch_initializes_from_one_primary_category(self):
+        config = _small_config(
+            action_branch_mode="eef",
+            auxiliary_action_init_category=2,
+        )
+        head = Gr00tN1d7ActionHead(config)
+        with torch.no_grad():
+            for parameter in head.action_encoder.parameters():
+                parameter.copy_(torch.randn_like(parameter))
+            for parameter in head.action_decoder.parameters():
+                parameter.copy_(torch.randn_like(parameter))
+        head.initialize_eef_branch_from_primary()
+
+        for target, source in (
+            (head.eef_action_encoder.W1, head.action_encoder.W1),
+            (head.eef_action_encoder.W2, head.action_encoder.W2),
+            (head.eef_action_encoder.W3, head.action_encoder.W3),
+            (head.eef_action_decoder.layer1, head.action_decoder.layer1),
+            (head.eef_action_decoder.layer2, head.action_decoder.layer2),
+        ):
+            torch.testing.assert_close(target.W[0], source.W[2])
+            torch.testing.assert_close(target.b[0], source.b[2])

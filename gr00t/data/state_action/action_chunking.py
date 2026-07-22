@@ -621,6 +621,10 @@ class EndEffectorActionChunk(ActionChunk[EndEffectorPose]):
 
         return xyz_rotvec
 
+    def to_translation_quat(self) -> NDArray[np.float64]:
+        """Convert trajectory to xyz plus canonical wxyz quaternions."""
+        return np.array([pose.xyz_quat_wxyz for pose in self._poses])
+
     def to_absolute_chunking(self, reference_frame: EndEffectorPose) -> "EndEffectorActionChunk":
         """
         Convert a relative end-effector action chunking to an absolute action chunking by
@@ -676,5 +680,7 @@ class EndEffectorActionChunk(ActionChunk[EndEffectorPose]):
             return self.to_translation_rot6d()
         elif action_format == ActionFormat.XYZ_ROTVEC:
             return self.to_translation_rotvec()
+        elif action_format == ActionFormat.XYZ_QUAT:
+            return self.to_translation_quat()
         else:
             raise ValueError(f"Unsupported action format: {action_format}")

@@ -15,6 +15,7 @@
 
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any, Tuple
 
@@ -47,6 +48,11 @@ class Gr00tN1d7ActionHead(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
+        if config.action_branch_mode not in {"primary", "eef", "primary_eef"}:
+            raise ValueError(
+                "action_branch_mode must be primary, eef, or primary_eef; got "
+                f"{config.action_branch_mode!r}"
+            )
 
         if config.use_alternate_vl_dit:
             self.model = AlternateVLDiT(
@@ -82,6 +88,31 @@ class Gr00tN1d7ActionHead(nn.Module):
             hidden_dim=self.hidden_size,
             output_dim=self.action_dim,
         )
+        # EEF is an auxiliary task, not another embodiment. Give it independent
+        # flow input/output adapters while retaining the shared state/context and
+        # DiT trunk. One category is sufficient for both human and robot EEF.
+        self.eef_action_encoder = None
+        self.eef_action_decoder = None
+        if config.action_branch_mode in {"eef", "primary_eef"}:
+            self.eef_action_encoder = MultiEmbodimentActionEncoder(
+                action_dim=self.action_dim,
+                hidden_size=self.input_embedding_dim,
+                num_embodiments=1,
+            )
+            self.eef_action_decoder = CategorySpecificMLP(
+                num_categories=1,
+                input_dim=self.hidden_size,
+                hidden_dim=self.hidden_size,
+                output_dim=self.action_dim,
+            )
+        if (
+            not math.isfinite(config.auxiliary_action_loss_weight)
+            or config.auxiliary_action_loss_weight <= 0
+        ):
+            raise ValueError(
+                "auxiliary_action_loss_weight must be finite and positive, got "
+                f"{config.auxiliary_action_loss_weight}"
+            )
 
         self.vlln = (
             nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
@@ -118,6 +149,9 @@ class Gr00tN1d7ActionHead(nn.Module):
             self.state_encoder.requires_grad_(False)
             self.action_encoder.requires_grad_(False)
             self.action_decoder.requires_grad_(False)
+            if self.eef_action_encoder is not None:
+                self.eef_action_encoder.requires_grad_(False)
+                self.eef_action_decoder.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.position_embedding.requires_grad_(False)
         if not tune_diffusion_model:
@@ -125,6 +159,10 @@ class Gr00tN1d7ActionHead(nn.Module):
         if not tune_vlln:
             self.vlln.requires_grad_(False)
             self.vl_self_attention.requires_grad_(False)
+        if self.config.action_branch_mode == "eef":
+            # Human EEF-only training must not touch token-specific adapters.
+            self.action_encoder.requires_grad_(False)
+            self.action_decoder.requires_grad_(False)
         logger.debug(f"Tune action head projector: {self.tune_projector}")
         logger.debug(f"Tune action head diffusion model: {self.tune_diffusion_model}")
         logger.debug(f"Tune action head vlln: {self.tune_vlln}")
@@ -147,6 +185,9 @@ class Gr00tN1d7ActionHead(nn.Module):
                 self.state_encoder.eval()
                 self.action_encoder.eval()
                 self.action_decoder.eval()
+                if self.eef_action_encoder is not None:
+                    self.eef_action_encoder.eval()
+                    self.eef_action_decoder.eval()
                 if self.config.add_pos_embed:
                     self.position_embedding.eval()
             if not self.tune_diffusion_model:
@@ -154,11 +195,43 @@ class Gr00tN1d7ActionHead(nn.Module):
             if not self.tune_vlln:
                 self.vlln.eval()
                 self.vl_self_attention.eval()
+            if self.config.action_branch_mode == "eef":
+                self.action_encoder.eval()
+                self.action_decoder.eval()
 
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         sample = (1 - sample) * self.config.noise_s
         return sample
+
+    @torch.no_grad()
+    def initialize_eef_branch_from_primary(self, category_id: int | None = None) -> None:
+        """Initialize a missing EEF branch from one pretrained primary category."""
+        if self.eef_action_encoder is None or self.eef_action_decoder is None:
+            raise RuntimeError("Cannot initialize EEF branch in primary-only mode")
+        category_id = (
+            self.config.auxiliary_action_init_category
+            if category_id is None
+            else category_id
+        )
+        if not 0 <= category_id < self.config.max_num_embodiments:
+            raise ValueError(
+                f"EEF initialization category {category_id} is outside "
+                f"[0, {self.config.max_num_embodiments})"
+            )
+
+        def copy_category(target, source) -> None:
+            target.W[0].copy_(source.W[category_id])
+            target.b[0].copy_(source.b[category_id])
+
+        for target, source in (
+            (self.eef_action_encoder.W1, self.action_encoder.W1),
+            (self.eef_action_encoder.W2, self.action_encoder.W2),
+            (self.eef_action_encoder.W3, self.action_encoder.W3),
+            (self.eef_action_decoder.layer1, self.action_decoder.layer1),
+            (self.eef_action_decoder.layer2, self.action_decoder.layer2),
+        ):
+            copy_category(target, source)
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
@@ -166,6 +239,68 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
+
+    def _run_flow_branch(
+        self,
+        *,
+        actions: torch.Tensor,
+        loss_mask: torch.Tensor,
+        state_features: torch.Tensor,
+        backbone_output: BatchFeature,
+        action_encoder: MultiEmbodimentActionEncoder,
+        action_decoder: CategorySpecificMLP,
+        adapter_ids: torch.Tensor,
+        mask_corruption: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one task-specific flow branch through the shared DiT trunk."""
+        if mask_corruption:
+            active_dims = (loss_mask > 0).to(dtype=actions.dtype)
+            branch_actions = actions * active_dims
+            noise = torch.randn_like(actions) * active_dims
+        else:
+            # Preserve legacy behavior for configurations without an auxiliary task.
+            branch_actions = actions
+            noise = torch.randn_like(actions)
+
+        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
+        t = t[:, None, None]
+        noisy_trajectory = (1 - t) * noise + t * branch_actions
+        velocity = branch_actions - noise
+        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
+        action_features = action_encoder(noisy_trajectory, t_discretized, adapter_ids)
+
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(
+                action_features.shape[1], dtype=torch.long, device=actions.device
+            )
+            action_features = action_features + self.position_embedding(pos_ids).unsqueeze(0)
+
+        sa_embs = torch.cat((state_features, action_features), dim=1)
+        vl_embeds = backbone_output.backbone_features
+        if self.config.use_alternate_vl_dit:
+            model_output, _ = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embeds,
+                encoder_attention_mask=backbone_output.backbone_attention_mask,
+                timestep=t_discretized,
+                return_all_hidden_states=True,
+                image_mask=backbone_output.image_mask,
+                backbone_attention_mask=backbone_output.backbone_attention_mask,
+            )
+        else:
+            model_output, _ = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embeds,
+                encoder_attention_mask=backbone_output.backbone_attention_mask,
+                timestep=t_discretized,
+                return_all_hidden_states=True,
+            )
+
+        pred = action_decoder(model_output, adapter_ids)
+        pred_actions = pred[:, -actions.shape[1] :]
+        elementwise_loss = F.mse_loss(pred_actions, velocity, reduction="none") * loss_mask
+        normalized_loss = elementwise_loss.sum() / (loss_mask.sum() + 1e-6)
+        return elementwise_loss, normalized_loss
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """
@@ -192,8 +327,6 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         # Get vision and language embeddings.
         vl_embeds = backbone_output.backbone_features
-        device = vl_embeds.device
-
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
 
@@ -213,62 +346,82 @@ class Gr00tN1d7ActionHead(nn.Module):
             do_dropout = do_dropout[:, None, None].to(dtype=state_features.dtype)
             state_features = state_features * (1 - do_dropout)
 
-        # Embed noised action trajectory.
         actions = action_input.action
-        noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
-        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
-        t = t[:, None, None]  # shape (B,1,1) for broadcast
-
-        noisy_trajectory = (1 - t) * noise + t * actions
-        velocity = actions - noise
-
-        # Convert (continuous) t -> discrete if needed
-        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
-        action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
-
-        # Maybe add position embedding.
-        if self.config.add_pos_embed:
-            pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-            action_features = action_features + pos_embs
-
-        # Join vision, language, state and action embedding along sequence dimension.
-        sa_embs = torch.cat((state_features, action_features), dim=1)
-        vl_attn_mask = backbone_output.backbone_attention_mask
-
-        if self.config.use_alternate_vl_dit:
-            image_mask = backbone_output.image_mask
-            backbone_attention_mask = backbone_output.backbone_attention_mask
-            model_output, _ = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embeds,
-                encoder_attention_mask=vl_attn_mask,
-                timestep=t_discretized,
-                return_all_hidden_states=True,
-                image_mask=image_mask,
-                backbone_attention_mask=backbone_attention_mask,
-            )
-        else:
-            model_output, _ = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embeds,
-                encoder_attention_mask=vl_attn_mask,
-                timestep=t_discretized,
-                return_all_hidden_states=True,
-            )
-
-        pred = self.action_decoder(model_output, embodiment_id)
-        pred_actions = pred[:, -actions.shape[1] :]
-
-        # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
-        action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+        auxiliary_selector = action_input.get("auxiliary_action_mask")
+        if auxiliary_selector is None:
+            auxiliary_selector = torch.zeros_like(action_mask)
+        if auxiliary_selector.shape != action_mask.shape:
+            raise ValueError(
+                "auxiliary_action_mask shape must match action_mask, got "
+                f"{tuple(auxiliary_selector.shape)} vs {tuple(action_mask.shape)}"
+            )
+        auxiliary_selector = (auxiliary_selector > 0).to(dtype=action_mask.dtype)
+        auxiliary_mask = action_mask * auxiliary_selector
+        primary_mask = action_mask * (1 - auxiliary_selector)
+        has_auxiliary = bool(torch.count_nonzero(auxiliary_mask).item())
+        has_primary = bool(torch.count_nonzero(primary_mask).item())
+        if not has_primary and not has_auxiliary:
+            raise ValueError("Action batch contains no supervised primary or auxiliary dimensions")
+        if self.config.action_branch_mode == "eef" and has_primary:
+            raise ValueError("EEF-only branch mode received primary action supervision")
+        if self.config.action_branch_mode == "primary" and has_auxiliary:
+            raise ValueError("Primary-only branch mode received auxiliary EEF supervision")
+
+        zero_loss = actions.new_zeros(())
+        primary_action_loss = torch.zeros_like(actions)
+        auxiliary_action_loss = torch.zeros_like(actions)
+        primary_loss = zero_loss
+        auxiliary_loss = zero_loss
+
+        if has_primary:
+            primary_action_loss, primary_loss = self._run_flow_branch(
+                actions=actions,
+                loss_mask=primary_mask,
+                state_features=state_features,
+                backbone_output=backbone_output,
+                action_encoder=self.action_encoder,
+                action_decoder=self.action_decoder,
+                adapter_ids=embodiment_id,
+                # Combined checkpoints always train the primary flow with
+                # auxiliary lanes fixed at zero, including primary-only batches.
+                mask_corruption=self.config.action_branch_mode == "primary_eef",
+            )
+        if has_auxiliary:
+            if self.eef_action_encoder is None or self.eef_action_decoder is None:
+                raise RuntimeError(
+                    "Auxiliary EEF labels require action_branch_mode 'eef' or 'primary_eef'"
+                )
+            auxiliary_ids = torch.zeros_like(embodiment_id)
+            auxiliary_action_loss, auxiliary_loss = self._run_flow_branch(
+                actions=actions,
+                loss_mask=auxiliary_mask,
+                state_features=state_features,
+                backbone_output=backbone_output,
+                action_encoder=self.eef_action_encoder,
+                action_decoder=self.eef_action_decoder,
+                adapter_ids=auxiliary_ids,
+                mask_corruption=True,
+            )
+
+        if has_primary and has_auxiliary:
+            loss = primary_loss + self.config.auxiliary_action_loss_weight * auxiliary_loss
+        elif has_primary:
+            loss = primary_loss
+        else:
+            # EEF-only human pretraining keeps a unit-normalized objective. The
+            # auxiliary weight only controls competition with the main task.
+            loss = auxiliary_loss
+        action_loss = primary_action_loss + auxiliary_action_loss
 
         return {
             "loss": loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
+            "primary_loss": primary_loss,
+            "auxiliary_loss": auxiliary_loss,
+            "token_loss": primary_loss,
+            "eef_loss": auxiliary_loss,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
@@ -331,17 +484,37 @@ class Gr00tN1d7ActionHead(nn.Module):
         """
         vl_embeds = backbone_features
 
+        if self.config.action_branch_mode == "eef":
+            raise RuntimeError("EEF-only checkpoints provide training supervision, not actions")
+
         # Set initial actions as the sampled noise.
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
-        actions = torch.randn(
+        primary_action_mask = torch.ones(
             size=(batch_size, self.config.action_horizon, self.action_dim),
             dtype=vl_embeds.dtype,
             device=device,
         )
+        if self.config.action_branch_mode == "primary_eef":
+            provided_mask = action_input.get("primary_action_mask")
+            if provided_mask is None:
+                raise RuntimeError(
+                    "primary_eef inference requires primary_action_mask from the processor"
+                )
+            if provided_mask.shape != primary_action_mask.shape:
+                raise ValueError(
+                    "primary_action_mask shape must match sampled actions, got "
+                    f"{tuple(provided_mask.shape)} vs {tuple(primary_action_mask.shape)}"
+                )
+            primary_action_mask = (provided_mask > 0).to(
+                device=device, dtype=vl_embeds.dtype
+            )
+            if not torch.count_nonzero(primary_action_mask).item():
+                raise RuntimeError("primary_eef inference mask contains no primary action slots")
+        actions = torch.randn_like(primary_action_mask) * primary_action_mask
 
         dt = 1.0 / self.num_inference_timesteps
-        vel_strength = torch.ones_like(actions)
+        vel_strength = primary_action_mask.clone()
 
         if "action" in action_input:
             # If action in input when doing get action, it means we want to use RTC.
@@ -380,6 +553,8 @@ class Gr00tN1d7ActionHead(nn.Module):
                 options["rtc_frozen_steps"] : options["rtc_overlap_steps"],
                 :,
             ] = ramp[None, :, None].to(device)
+            actions = actions * primary_action_mask
+            vel_strength = vel_strength * primary_action_mask
 
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):
@@ -417,10 +592,10 @@ class Gr00tN1d7ActionHead(nn.Module):
                 )
             pred = self.action_decoder(model_output, embodiment_id)
 
-            pred_velocity = pred[:, -self.action_horizon :]
+            pred_velocity = pred[:, -self.action_horizon :] * primary_action_mask
 
             # Update actions using euler integration.
-            actions = actions + dt * pred_velocity * vel_strength
+            actions = (actions + dt * pred_velocity * vel_strength) * primary_action_mask
 
         return BatchFeature(
             data={

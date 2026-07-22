@@ -230,7 +230,7 @@ def run(config: Config):
         report_to="wandb" if config.training.use_wandb else "none",
         seed=config.data.seed,
         deepspeed=deepspeed_config,
-        ddp_find_unused_parameters=False,
+        ddp_find_unused_parameters=config.training.ddp_find_unused_parameters,
         ddp_bucket_cap_mb=config.training.ddp_bucket_cap_mb,
         eval_strategy=config.training.eval_strategy,
         eval_steps=config.training.eval_steps,

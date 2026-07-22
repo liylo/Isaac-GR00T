@@ -15,6 +15,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 from typing import Any
 
 import numpy as np
@@ -43,8 +44,10 @@ class ActionType(Enum):
 
 class ActionFormat(Enum):
     DEFAULT = "default"
+    XYZ = "xyz"
     XYZ_ROT6D = "xyz+rot6d"
     XYZ_ROTVEC = "xyz+rotvec"
+    XYZ_QUAT = "xyz+quat"
 
 
 @dataclass
@@ -79,6 +82,12 @@ class ActionConfig:
     type: ActionType
     format: ActionFormat
     state_key: str | None = None
+    source_format: ActionFormat | None = None
+    delta_indices: list[int] | None = None
+    model_offset: int | None = None
+    loss_weight: float = 1.0
+    decode_to_absolute: bool = True
+    is_auxiliary: bool = False
 
 
 @dataclass
@@ -99,6 +108,8 @@ class ModalityConfig:
     """Optional list of keys to apply mean/std normalization. If None or empty, use min/max normalization for all keys."""
     first_frame_relative_quaternion_keys: list[str] | None = None
     """Optional list of quaternion keys to express as rotation relative to the first frame of each episode."""
+    reference_only_keys: list[str] | None = None
+    """State keys loaded only as action reference frames, never encoded as model state."""
     action_configs: list[ActionConfig] | None = None
 
     def __post_init__(self):
@@ -111,6 +122,19 @@ class ModalityConfig:
             or len(self.modality_keys) == 0
         ):
             raise ValueError(f"modality_keys must be a non-empty list, got {self.modality_keys!r}")
+        if self.reference_only_keys is not None:
+            if not isinstance(self.reference_only_keys, list):
+                raise ValueError(
+                    f"reference_only_keys must be a list, got {self.reference_only_keys!r}"
+                )
+            if len(self.reference_only_keys) != len(set(self.reference_only_keys)):
+                raise ValueError("reference_only_keys must not contain duplicates")
+            overlap = set(self.modality_keys) & set(self.reference_only_keys)
+            if overlap:
+                raise ValueError(
+                    "reference_only_keys must not overlap model modality_keys, got "
+                    f"{sorted(overlap)}"
+                )
         if self.action_configs is not None:
             assert len(self.action_configs) == len(self.modality_keys), (
                 f"Number of action configs ({len(self.action_configs)}) must match number of modality keys ({len(self.modality_keys)})"
@@ -123,6 +147,50 @@ class ModalityConfig:
                         type=ActionType[action_config["type"]],
                         format=ActionFormat[action_config["format"]],
                         state_key=action_config.get("state_key", None),
+                        source_format=(
+                            ActionFormat[action_config["source_format"]]
+                            if action_config.get("source_format") is not None
+                            else None
+                        ),
+                        delta_indices=action_config.get("delta_indices"),
+                        model_offset=action_config.get("model_offset"),
+                        loss_weight=action_config.get("loss_weight", 1.0),
+                        decode_to_absolute=action_config.get("decode_to_absolute", True),
+                        is_auxiliary=action_config.get("is_auxiliary", False),
                     )
+                if action_config.delta_indices is not None and len(
+                    action_config.delta_indices
+                ) != len(self.delta_indices):
+                    raise ValueError(
+                        "Per-key action delta_indices must have the same length as the "
+                        f"modality horizon ({len(self.delta_indices)}), got "
+                        f"{len(action_config.delta_indices)}"
+                    )
+                if action_config.model_offset is not None and action_config.model_offset < 0:
+                    raise ValueError(
+                        f"Action model_offset must be non-negative, got {action_config.model_offset}"
+                    )
+                if action_config.format == ActionFormat.XYZ:
+                    if action_config.type != ActionType.EEF:
+                        raise ValueError("ActionFormat.XYZ is only supported for EEF actions")
+                    if action_config.source_format not in {
+                        ActionFormat.XYZ_ROT6D,
+                        ActionFormat.XYZ_ROTVEC,
+                        ActionFormat.XYZ_QUAT,
+                    }:
+                        raise ValueError(
+                            "XYZ-only EEF actions require a source_format containing rotation"
+                        )
+                    if action_config.decode_to_absolute:
+                        raise ValueError(
+                            "XYZ-only EEF actions cannot decode an absolute rotation; "
+                            "set decode_to_absolute=False"
+                        )
+                if not math.isfinite(action_config.loss_weight) or action_config.loss_weight <= 0:
+                    raise ValueError(
+                        f"Action loss_weight must be finite and positive, got {action_config.loss_weight}"
+                    )
+                if action_config.is_auxiliary and action_config.type != ActionType.EEF:
+                    raise ValueError("Only EEF actions can use the auxiliary action head")
                 parsed_action_configs.append(action_config)
             self.action_configs = parsed_action_configs

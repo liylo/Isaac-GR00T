@@ -301,6 +301,10 @@ class LeRobotEpisodeLoader:
                         modality_keys=[modality_configs[modality].modality_keys[0]],
                         sin_cos_embedding_keys=modality_configs[modality].sin_cos_embedding_keys,
                         mean_std_embedding_keys=modality_configs[modality].mean_std_embedding_keys,
+                        first_frame_relative_quaternion_keys=modality_configs[
+                            modality
+                        ].first_frame_relative_quaternion_keys,
+                        reference_only_keys=modality_configs[modality].reference_only_keys,
                         action_configs=modality_configs[modality].action_configs[:1]
                         if modality_configs[modality].action_configs is not None
                         else None,
@@ -431,9 +435,15 @@ class LeRobotEpisodeLoader:
         for modality_type in ["state", "action"]:
             if modality_type not in self.modality_configs:
                 continue
+            modality_config = self.modality_configs[modality_type]
+            joint_groups = list(modality_config.modality_keys)
+            if modality_type == "state":
+                for key in modality_config.reference_only_keys or []:
+                    if key not in joint_groups:
+                        joint_groups.append(key)
             joint_groups_df = self._extract_joint_groups(
                 original_df,
-                self.modality_configs[modality_type].modality_keys,
+                joint_groups,
                 modality_type,
             )
             for joint_group in joint_groups_df.columns:
@@ -551,10 +561,7 @@ class LeRobotEpisodeLoader:
             episode_df = episode_df.iloc[: min(len(episode_df), nominal_length)]
             all_values.append(
                 np.vstack(
-                    [
-                        np.asarray(x, dtype=np.float32)
-                        for x in episode_df[f"{modality}.{joint_key}"]
-                    ]
+                    [np.asarray(x, dtype=np.float32) for x in episode_df[f"{modality}.{joint_key}"]]
                 )
             )
 
@@ -642,7 +649,59 @@ class LeRobotEpisodeLoader:
             raise ValueError(f"Language key {lang_key} not supported")
         return new_languages
 
-    def __getitem__(self, idx: int) -> pd.DataFrame:
+    def _normalize_requested_indices(
+        self, indices: list[int] | np.ndarray | None, actual_length: int
+    ) -> np.ndarray:
+        """Return sorted unique row indices, or every row when indices is None."""
+        if indices is None:
+            return np.arange(actual_length, dtype=np.int64)
+
+        requested_indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+        if requested_indices.size == 0:
+            return requested_indices
+
+        if np.any(requested_indices < 0) or np.any(requested_indices >= actual_length):
+            raise IndexError(
+                f"Requested frame indices out of bounds for episode with {actual_length} frames: "
+                f"{requested_indices[(requested_indices < 0) | (requested_indices >= actual_length)]}"
+            )
+        return np.unique(requested_indices)
+
+    def _add_indexed_columns(
+        self,
+        df: pd.DataFrame,
+        column_prefix: str,
+        values_by_key: dict[str, np.ndarray],
+        indices: np.ndarray,
+        actual_length: int,
+        sparse: bool,
+    ) -> None:
+        """Attach dense or sparse media columns to an episode dataframe."""
+        for key, values in values_by_key.items():
+            assert len(values) == len(indices), (
+                f"{column_prefix} data for {key} has length {len(values)} but requested "
+                f"indices has length {len(indices)}"
+            )
+            column_name = f"{column_prefix}.{key}"
+            if sparse:
+                column = np.empty(actual_length, dtype=object)
+                column[:] = None
+                for row_idx, value in zip(indices, values):
+                    column[int(row_idx)] = value
+                df[column_name] = column
+            else:
+                assert len(values) == len(df), (
+                    f"{column_prefix} data for {key} has length {len(values)} but dataframe "
+                    f"has length {len(df)}"
+                )
+                df[column_name] = [value for value in values]
+
+    def load_episode_data(
+        self,
+        idx: int,
+        frame_indices: list[int] | np.ndarray | None = None,
+        mask_indices: list[int] | np.ndarray | None = None,
+    ) -> pd.DataFrame:
         """
         Load complete episode data as a processed DataFrame.
 
@@ -652,6 +711,10 @@ class LeRobotEpisodeLoader:
 
         Args:
             idx: Episode index to load
+            frame_indices: Optional subset of video frame rows to decode. Unrequested
+                video rows are left as None and must not be accessed by callers.
+            mask_indices: Optional subset of mask frame rows to load. Unrequested
+                mask rows are left as None and must not be accessed by callers.
 
         Returns:
             DataFrame with columns for all modalities and timestamps, with video frames
@@ -680,25 +743,34 @@ class LeRobotEpisodeLoader:
         actual_length = min(len(df), nominal_length)
         df = df.iloc[:actual_length]
 
-        # Load synchronized video data
-        video_data = self._load_video_data(episode_id, np.arange(actual_length))
+        # Load synchronized media. Sharded training usually needs only a sparse
+        # subset of video frames from each episode; avoid decoding full videos.
+        normalized_frame_indices = self._normalize_requested_indices(frame_indices, actual_length)
+        video_data = self._load_video_data(episode_id, normalized_frame_indices)
+        self._add_indexed_columns(
+            df,
+            "video",
+            video_data,
+            normalized_frame_indices,
+            actual_length,
+            sparse=frame_indices is not None,
+        )
 
-        # Add video frames to dataframe as PIL Images
-        for key in video_data.keys():
-            assert len(video_data[key]) == len(df), (
-                f"Video data for {key} has length {len(video_data[key])} but dataframe has length {len(df)}"
-            )
-            df[f"video.{key}"] = [frame for frame in video_data[key]]
-
-        # Load synchronized mask data
-        mask_data = self._load_mask_data(episode_id, np.arange(actual_length))
-        for key in mask_data.keys():
-            assert len(mask_data[key]) == len(df), (
-                f"Mask data for {key} has length {len(mask_data[key])} but dataframe has length {len(df)}"
-            )
-            df[f"mask.{key}"] = [mask for mask in mask_data[key]]
+        normalized_mask_indices = self._normalize_requested_indices(mask_indices, actual_length)
+        mask_data = self._load_mask_data(episode_id, normalized_mask_indices)
+        self._add_indexed_columns(
+            df,
+            "mask",
+            mask_data,
+            normalized_mask_indices,
+            actual_length,
+            sparse=mask_indices is not None,
+        )
 
         return df
+
+    def __getitem__(self, idx: int) -> pd.DataFrame:
+        return self.load_episode_data(idx)
 
     def get_initial_actions(self):
         """

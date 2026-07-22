@@ -31,8 +31,8 @@ from gr00t.configs.data.embodiment_configs import (
     ActionType,
     ModalityConfig,
 )
-from gr00t.data.state_action.action_chunking import EndEffectorActionChunk, JointActionChunk
-from gr00t.data.state_action.pose import EndEffectorPose, JointPose
+from gr00t.data.state_action.action_chunking import JointActionChunk
+from gr00t.data.state_action.pose import JointPose, compose_eef_pose_array, relative_eef_pose_array
 from gr00t.data.utils import (
     apply_sin_cos_encoding,
     nested_dict_to_numpy,
@@ -179,11 +179,20 @@ class StateActionProcessor:
                                     f"Relative action statistics required for key '{key}' "
                                     f"in embodiment '{embodiment_tag}' but not found"
                                 )
-                            action_dim = self.norm_params[embodiment_tag]["action"][key]["dim"]
-                            self.norm_params[embodiment_tag]["action"][key] = nested_dict_to_numpy(
+                            relative_params = nested_dict_to_numpy(
                                 self.statistics[embodiment_tag]["relative_action"][key]
                             )
-                            self.norm_params[embodiment_tag]["action"][key]["dim"] = action_dim
+                            if action_config.format == ActionFormat.XYZ:
+                                stat_dim = relative_params["min"].shape[-1]
+                                if stat_dim not in (3, 9):
+                                    raise ValueError(
+                                        f"XYZ-only relative stats for '{key}' must have "
+                                        f"3 or 9 values, got {stat_dim}"
+                                    )
+                                for stat_name in ("min", "max", "q01", "q99", "mean", "std"):
+                                    relative_params[stat_name] = relative_params[stat_name][..., :3]
+                            relative_params["dim"] = np.array(relative_params["min"].shape[-1])
+                            self.norm_params[embodiment_tag]["action"][key] = relative_params
 
     def apply_state(
         self,
@@ -373,6 +382,7 @@ class StateActionProcessor:
                         reference_state=reference_state,
                         action_type=action_config.type,
                         action_format=action_config.format,
+                        source_format=action_config.source_format,
                     )
 
         # Step 2: Normalize actions
@@ -457,7 +467,11 @@ class StateActionProcessor:
 
         if action_configs is not None:
             for key, action_config in zip(modality_keys, action_configs):
-                if action_config.rep == ActionRepresentation.RELATIVE and self.use_relative_action:
+                if (
+                    action_config.rep == ActionRepresentation.RELATIVE
+                    and self.use_relative_action
+                    and action_config.decode_to_absolute
+                ):
                     if state is None:
                         raise ValueError(
                             f"State dict required for relative->absolute conversion of key '{key}' "
@@ -497,6 +511,7 @@ class StateActionProcessor:
                             reference_state=s[-1],
                             action_type=action_config.type,
                             action_format=action_config.format,
+                            source_format=action_config.source_format,
                         )
                         absolute_actions.append(absolute_action)
 
@@ -613,10 +628,32 @@ class StateActionProcessor:
         Returns:
             Total action dimension across all joint groups
         """
-        total_dim = 0
-        for joint_group in self.modality_configs[embodiment_tag]["action"].modality_keys:
-            total_dim += self.norm_params[embodiment_tag]["action"][joint_group]["dim"].item()
-        return total_dim
+        slices = self.get_action_slices(embodiment_tag)
+        return max((end for _start, end in slices.values()), default=0)
+
+    def get_action_slices(self, embodiment_tag: str) -> dict[str, tuple[int, int]]:
+        """Return each action group's fixed model-space slice."""
+        modality_config = self.modality_configs[embodiment_tag]["action"]
+        action_configs = modality_config.action_configs
+        slices: dict[str, tuple[int, int]] = {}
+        cursor = 0
+        for index, key in enumerate(modality_config.modality_keys):
+            dim = int(self.norm_params[embodiment_tag]["action"][key]["dim"].item())
+            configured_offset = None
+            if action_configs is not None:
+                configured_offset = action_configs[index].model_offset
+            start = cursor if configured_offset is None else configured_offset
+            end = start + dim
+            for other_key, (other_start, other_end) in slices.items():
+                if start < other_end and other_start < end:
+                    raise ValueError(
+                        f"Action model slices overlap for embodiment '{embodiment_tag}': "
+                        f"'{key}' [{start}, {end}) and '{other_key}' "
+                        f"[{other_start}, {other_end})"
+                    )
+            slices[key] = (start, end)
+            cursor = max(cursor, end)
+        return slices
 
     def _convert_to_relative_action(
         self,
@@ -624,14 +661,20 @@ class StateActionProcessor:
         reference_state: np.ndarray,
         action_type: ActionType,
         action_format: ActionFormat,
+        source_format: ActionFormat | None = None,
     ) -> np.ndarray:
         """Convert absolute action to relative action using reference state."""
         assert action.ndim == 2, f"Expected action shape (T, D), got {action.shape}"
         assert reference_state.ndim == 1, f"Expected state shape (D,), got {reference_state.shape}"
 
         if action_type == ActionType.EEF:
-            action_chunking = EndEffectorActionChunk.from_array(action, action_format)
-            reference_frame = EndEffectorPose.from_action_format(reference_state, action_format)
+            source_format = source_format or action_format
+            return relative_eef_pose_array(
+                action,
+                reference_state,
+                source_format=source_format,
+                output_format=action_format,
+            )
 
         elif action_type == ActionType.NON_EEF:
             action_chunking = JointActionChunk([JointPose(m) for m in action])
@@ -651,19 +694,24 @@ class StateActionProcessor:
         reference_state: np.ndarray,
         action_type: ActionType,
         action_format: ActionFormat,
+        source_format: ActionFormat | None = None,
     ) -> np.ndarray:
         """Convert relative action to absolute action using reference state."""
         assert action.ndim == 2, f"Expected action shape (T, D), got {action.shape}"
         assert reference_state.ndim == 1, f"Expected state shape (D,), got {reference_state.shape}"
-        assert reference_state.shape[0] == action.shape[1], (
-            f"State dim {reference_state.shape[0]} != action dim {action.shape[1]}"
-        )
 
         if action_type == ActionType.EEF:
-            rel_action = EndEffectorActionChunk.from_array(action, action_format)
-            reference_frame = EndEffectorPose.from_action_format(reference_state, action_format)
+            return compose_eef_pose_array(
+                action,
+                reference_state,
+                relative_format=action_format,
+                output_format=source_format or action_format,
+            )
 
         elif action_type == ActionType.NON_EEF:
+            assert reference_state.shape[0] == action.shape[1], (
+                f"State dim {reference_state.shape[0]} != action dim {action.shape[1]}"
+            )
             rel_action = JointActionChunk([JointPose(pose) for pose in action])
             reference_frame = JointPose(reference_state)
 
@@ -671,7 +719,7 @@ class StateActionProcessor:
             raise ValueError(f"Unknown ActionType: {action_type}")
 
         abs_action = rel_action.to_absolute_chunking(reference_frame=reference_frame)
-        return abs_action.to(action_format)
+        return abs_action.to(source_format or action_format)
 
     def __str__(self) -> str:
         return f"StateActionProcessor(modality_configs={self.modality_configs}, statistics={self.statistics}, use_percentiles={self.use_percentiles}, clip_outliers={self.clip_outliers}, apply_sincos_state_encoding={self.apply_sincos_state_encoding}, use_relative_action={self.use_relative_action})"

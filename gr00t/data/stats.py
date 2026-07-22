@@ -28,8 +28,10 @@ Args:
     modality_config_path: Optional path to a .py config file for custom embodiment tags not in the built-in registry.
 """
 
+import hashlib
 import json
 from pathlib import Path
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -37,8 +39,8 @@ from tqdm import tqdm
 
 from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
 from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
-from gr00t.data.state_action.action_chunking import EndEffectorActionChunk, JointActionChunk
-from gr00t.data.state_action.pose import EndEffectorPose, JointPose
+from gr00t.data.state_action.action_chunking import JointActionChunk
+from gr00t.data.state_action.pose import JointPose, relative_eef_pose_array
 from gr00t.data.types import ActionRepresentation, ActionType, EmbodimentTag, ModalityConfig
 from gr00t.data.utils import to_json_serializable
 
@@ -47,6 +49,44 @@ LE_ROBOT_DATA_FILENAME = "data/*/*.parquet"
 LE_ROBOT_INFO_FILENAME = "meta/info.json"
 LE_ROBOT_STATS_FILENAME = "meta/stats.json"
 LE_ROBOT_REL_STATS_FILENAME = "meta/relative_stats.json"
+LE_ROBOT_REL_STATS_CONFIG_FILENAME = "meta/relative_stats_config.json"
+RELATIVE_STATS_ALGORITHM_VERSION = 3
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    """Write JSON via a sibling temporary file so read-only files can be replaced."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", dir=path.parent, suffix=path.suffix, delete=False
+    ) as temporary_file:
+        temporary_path = Path(temporary_file.name)
+        json.dump(to_json_serializable(data), temporary_file, indent=4)
+    try:
+        temporary_path.chmod(path.stat().st_mode if path.exists() else 0o644)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _relative_stats_source_hash(dataset_path: Path, action_key: str, state_key: str) -> str:
+    """Fingerprint the raw state/action slices used to derive relative statistics."""
+    with open(dataset_path / "meta" / "modality.json") as f:
+        modality = json.load(f)
+    with open(dataset_path / LE_ROBOT_STATS_FILENAME) as f:
+        raw_stats = json.load(f)
+
+    source_stats = {}
+    for group_name, key in (("state", state_key), ("action", action_key)):
+        entry = modality[group_name][key]
+        source_key = entry.get(
+            "original_key", "observation.state" if group_name == "state" else "action"
+        )
+        start, end = entry["start"], entry["end"]
+        source_stats[group_name] = {
+            stat_name: values[start:end] for stat_name, values in raw_stats[source_key].items()
+        }
+    payload = json.dumps(source_stats, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def calculate_dataset_statistics(
@@ -127,8 +167,7 @@ def generate_stats(dataset_path: Path | str):
     parquet_files = list(dataset_path.glob(LE_ROBOT_DATA_FILENAME))
     stats = calculate_dataset_statistics(parquet_files, lowdim_features)
     stats_path = dataset_path / LE_ROBOT_STATS_FILENAME
-    with open(stats_path, "w") as f:
-        json.dump(stats, f, indent=4)
+    _write_json_atomic(stats_path, stats)
 
 
 class RelativeActionLoader:
@@ -142,21 +181,22 @@ class RelativeActionLoader:
         action_configs = MODALITY_CONFIGS[embodiment_tag.value]["action"].action_configs
         assert action_configs is not None, MODALITY_CONFIGS[embodiment_tag.value]["action"]
         self.action_config = action_configs[idx]
+        action_delta_indices = (
+            self.action_config.delta_indices
+            or MODALITY_CONFIGS[embodiment_tag.value]["action"].delta_indices
+        )
         self.modality_configs["action"] = ModalityConfig(
-            delta_indices=MODALITY_CONFIGS[embodiment_tag.value]["action"].delta_indices,
+            delta_indices=action_delta_indices,
             modality_keys=[action_key],
         )
         # Check state config
         state_key = self.action_config.state_key or action_key
-        assert state_key in MODALITY_CONFIGS[embodiment_tag.value]["state"].modality_keys
+        state_config = MODALITY_CONFIGS[embodiment_tag.value]["state"]
+        available_state_keys = state_config.modality_keys + (state_config.reference_only_keys or [])
+        assert state_key in available_state_keys
         self.modality_configs["state"] = ModalityConfig(
-            delta_indices=MODALITY_CONFIGS[embodiment_tag.value]["state"].delta_indices,
+            delta_indices=state_config.delta_indices,
             modality_keys=[state_key],
-        )
-        # Check state-action consistency
-        assert (
-            self.modality_configs["state"].delta_indices[-1]
-            == self.modality_configs["action"].delta_indices[0]
         )
         self.loader = LeRobotEpisodeLoader(dataset_path, self.modality_configs)
 
@@ -174,22 +214,32 @@ class RelativeActionLoader:
         # Convert to numpy arrays once - this is much faster than repeated pandas access
         state_data = df[state_key].values  # Shape: (episode_length, joint_dim)
         action_data = df[action_key].values  # Shape: (episode_length, joint_dim)
-        trajectories = []
-        usable_length = len(df) - self.modality_configs["action"].delta_indices[-1]
+        usable_length = len(df) - max(self.modality_configs["action"].delta_indices)
         action_delta_indices = np.array(self.modality_configs["action"].delta_indices)
+        if self.action_config.type == ActionType.EEF:
+            source_format = self.action_config.source_format or self.action_config.format
+            state_indices = (
+                np.arange(usable_length) + self.modality_configs["state"].delta_indices[-1]
+            )
+            action_indices = np.arange(usable_length)[:, None] + action_delta_indices[None, :]
+            references = np.stack(state_data[state_indices]).astype(np.float64)
+            actions = np.stack(action_data[action_indices.reshape(-1)]).astype(np.float64)
+            repeated_references = np.repeat(references, len(action_delta_indices), axis=0)
+            relative = relative_eef_pose_array(
+                actions,
+                repeated_references,
+                source_format=source_format,
+                output_format=self.action_config.format,
+            )
+            return list(relative.reshape(usable_length, len(action_delta_indices), -1))
+
+        trajectories = []
         for i in range(usable_length):
             state_ind = self.modality_configs["state"].delta_indices[-1] + i
             action_inds = action_delta_indices + i
             last_state = state_data[state_ind]
             actions = action_data[action_inds]
-            if self.action_config.type == ActionType.EEF:
-                action_format = self.action_config.format
-                reference_frame = EndEffectorPose.from_action_format(last_state, action_format)
-                traj = EndEffectorActionChunk.from_array(actions, action_format).relative_chunking(
-                    reference_frame=reference_frame
-                )
-                trajectories.append(traj.to(action_format).astype(np.float32))
-            elif self.action_config.type == ActionType.NON_EEF:
+            if self.action_config.type == ActionType.NON_EEF:
                 reference_frame = JointPose(last_state)
                 traj = JointActionChunk([JointPose(m) for m in actions]).relative_chunking(
                     reference_frame=reference_frame
@@ -241,13 +291,38 @@ def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) 
             stats = json.load(f)
     else:
         stats = {}
+    config_path = Path(dataset_path) / LE_ROBOT_REL_STATS_CONFIG_FILENAME
+    if config_path.exists():
+        with open(config_path, "r") as f:
+            stored_configs = json.load(f)
+    else:
+        stored_configs = {}
     for action_key in sorted(action_keys):
-        if action_key in stats:
+        index = action_config.modality_keys.index(action_key)
+        key_config = action_config.action_configs[index]
+        state_key = key_config.state_key or action_key
+        fingerprint = {
+            "algorithm_version": RELATIVE_STATS_ALGORITHM_VERSION,
+            "representation": key_config.rep.name,
+            "action_type": key_config.type.name,
+            "format": key_config.format.name,
+            "source_format": (
+                key_config.source_format.name if key_config.source_format is not None else None
+            ),
+            "state_key": key_config.state_key,
+            "delta_indices": key_config.delta_indices or action_config.delta_indices,
+            "model_offset": key_config.model_offset,
+            "loss_weight": key_config.loss_weight,
+            "source_stats_sha256": _relative_stats_source_hash(dataset_path, action_key, state_key),
+        }
+        if action_key in stats and stored_configs.get(action_key) == fingerprint:
             continue
         print(f"Generating relative stats for {dataset_path} {embodiment_tag} {action_key}")
         stats[action_key] = calculate_stats_for_key(dataset_path, embodiment_tag, action_key)
-    with open(stats_path, "w") as f:
-        json.dump(to_json_serializable(dict(stats)), f, indent=4)
+        stored_configs[action_key] = fingerprint
+        # Persist each expensive key immediately so an interrupted run can resume.
+        _write_json_atomic(stats_path, dict(stats))
+        _write_json_atomic(config_path, stored_configs)
 
 
 def main(

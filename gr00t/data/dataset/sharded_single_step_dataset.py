@@ -37,22 +37,37 @@ def extract_step_data(
     # Extract data for each configured modality
     for modality, config in modality_configs.items():
         step_data[modality] = {}
-        # Sample timesteps according to delta indices configuration
-        indices_to_load = [step_index + delta_index for delta_index in config.delta_indices]
-        if allow_padding:
-            indices_to_load = [max(0, min(idx, len(episode_data) - 1)) for idx in indices_to_load]
-        for key in config.modality_keys:
-            if f"{modality}.{key}" in episode_data.columns:
-                modality_data = episode_data[f"{modality}.{key}"].iloc[indices_to_load]
-            else:
+        modality_keys = list(config.modality_keys)
+        if modality == "state":
+            for key in config.reference_only_keys or []:
+                if key not in modality_keys:
+                    modality_keys.append(key)
+
+        for key_index, key in enumerate(modality_keys):
+            delta_indices = config.delta_indices
+            if (
+                modality == "action"
+                and config.action_configs is not None
+                and config.action_configs[key_index].delta_indices is not None
+            ):
+                delta_indices = config.action_configs[key_index].delta_indices
+            indices_to_load = [step_index + delta_index for delta_index in delta_indices]
+            if allow_padding:
+                indices_to_load = [
+                    max(0, min(idx, len(episode_data) - 1)) for idx in indices_to_load
+                ]
+            indices_to_load = np.asarray(indices_to_load, dtype=np.int64)
+            column_name = f"{modality}.{key}"
+            if column_name not in episode_data.columns:
                 raise KeyError(
                     f"{modality}.{key} not found in episode data, available keys: {episode_data.columns}"
                 )
+            modality_data = episode_data[column_name].to_numpy(copy=False)[indices_to_load]
             if modality in ["state", "action"]:
                 # Stack arrays for numerical modalities
                 step_data[modality][key] = np.vstack(
                     [
-                        np.array(modality_data.iloc[i]).astype(np.float32)
+                        np.array(modality_data[i]).astype(np.float32)
                         for i in range(len(modality_data))
                     ]
                 )
@@ -153,8 +168,19 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.allow_padding = allow_padding
         self.processor = None
         self.rng = np.random.default_rng(seed)
-        action_delta_indices = modality_configs["action"].delta_indices
-        self.action_horizon = max(action_delta_indices) - min(action_delta_indices) + 1
+        action_config = modality_configs["action"]
+        action_delta_indices = [action_config.delta_indices]
+        if action_config.action_configs is not None:
+            action_delta_indices.extend(
+                config.delta_indices
+                for config in action_config.action_configs
+                if config.delta_indices is not None
+            )
+        flattened_action_indices = [index for indices in action_delta_indices for index in indices]
+        if min(flattened_action_indices) < 0:
+            raise ValueError("Negative action delta indices are not supported by sharded training")
+        self.max_action_delta_index = max(flattened_action_indices)
+        self.action_horizon = len(action_config.delta_indices)
 
         self.episode_loader = LeRobotEpisodeLoader(
             dataset_path=dataset_path,
@@ -225,7 +251,7 @@ class ShardedSingleStepDataset(ShardedDataset):
     def get_effective_episode_length(self, episode_index: int) -> int:
         """Get the effective episode length accounting for action horizon."""
         original_length = self.episode_loader.get_episode_length(episode_index)
-        return max(0, original_length - self.action_horizon + 1)
+        return max(0, original_length - self.max_action_delta_index)
 
     def __len__(self):
         """Return the number of shards in the dataset."""
@@ -264,6 +290,41 @@ class ShardedSingleStepDataset(ShardedDataset):
         """Get the number of timesteps in a specific shard."""
         return self.shard_lengths[idx]
 
+    def _get_required_media_indices(
+        self,
+        step_indices: np.ndarray,
+        modality: str,
+        episode_length: int,
+    ) -> np.ndarray | None:
+        """Compute episode row indices needed for sparse media loading."""
+        if modality not in self.modality_configs:
+            return None
+
+        delta_indices = np.asarray(self.modality_configs[modality].delta_indices, dtype=np.int64)
+        requested_indices = (
+            np.asarray(step_indices, dtype=np.int64)[:, None] + delta_indices[None, :]
+        ).reshape(-1)
+
+        if self.allow_padding:
+            requested_indices = np.clip(requested_indices, 0, episode_length - 1)
+        else:
+            # ``extract_step_data`` uses pandas iloc, where negative indices
+            # address rows from the end. Resolve them here so sparse media
+            # columns include exactly the rows iloc will later access.
+            out_of_bounds = (requested_indices >= episode_length) | (
+                requested_indices < -episode_length
+            )
+            if np.any(out_of_bounds):
+                raise IndexError(
+                    f"Requested {modality} indices out of bounds for episode with "
+                    f"{episode_length} frames: {requested_indices[out_of_bounds]}"
+                )
+            requested_indices = np.where(
+                requested_indices < 0, requested_indices + episode_length, requested_indices
+            )
+
+        return np.unique(requested_indices)
+
     def get_shard(self, idx: int) -> list:
         """
         Load and process all timesteps in a specific shard.
@@ -280,8 +341,16 @@ class ShardedSingleStepDataset(ShardedDataset):
         episodes = self.sharded_episodes[idx]
         datapoints = []
         for ep_idx, step_indices in episodes:
-            # Load episode data once per episode in shard
-            episode_data = self.episode_loader[ep_idx]
+            # Load episode data once per episode in shard. Only decode media
+            # frames that this shard can actually access.
+            episode_length = self.episode_loader.get_episode_length(ep_idx)
+            frame_indices = self._get_required_media_indices(step_indices, "video", episode_length)
+            mask_indices = self._get_required_media_indices(step_indices, "mask", episode_length)
+            episode_data = self.episode_loader.load_episode_data(
+                ep_idx,
+                frame_indices=frame_indices,
+                mask_indices=mask_indices,
+            )
             for step_index in step_indices:
                 datapoints.append(self.get_datapoint(episode_data, step_index))
         return datapoints

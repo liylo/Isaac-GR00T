@@ -317,6 +317,23 @@ class Gr00tTrainer(Trainer):
         # Record last loss for testing purposes.
         self.loss = loss
 
+        # The EEF objective is auxiliary to the primary token objective. Log
+        # both independently so transfer runs can detect task imbalance even
+        # though optimization uses their weighted sum.
+        if self.state.global_step % self.args.logging_steps == 0 and model.training:
+            task_loss_logs = {}
+            for output_key, log_key in (
+                ("token_loss", "train_token_loss"),
+                ("eef_loss", "train_eef_loss"),
+            ):
+                task_loss = outputs.get(output_key) if hasattr(outputs, "get") else None
+                if not torch.is_tensor(task_loss):
+                    continue
+                value = self._nested_gather(task_loss.detach()).mean().item()
+                task_loss_logs[log_key] = value
+            if task_loss_logs and self.args.local_rank in (-1, 0):
+                self.log(task_loss_logs)
+
         # --------------------------------------------------------------
         # Accuracy calculation
         # --------------------------------------------------------------

@@ -44,6 +44,12 @@ class FinetuneConfig:
     If None, use the pre-registered modality config in `gr00t/configs/data/embodiment_configs.py`. 
     """
 
+    endpose_xyz_only: bool = False
+    """If True, EEF auxiliary targets supervise relative xyz only, without rotation."""
+
+    endpose_loss_weight: float = 0.5
+    """Relative weight of EEF loss when token and EEF branches are both active."""
+
     # --- Model Tuning Flags ---
     tune_llm: bool = False
     """If True, fine-tune the language model (LLM) backbone during training."""
@@ -135,6 +141,9 @@ class FinetuneConfig:
     The project is `finetune-gr00t-n1d7`.
     You need to login to wandb to view the logs.
     """
+
+    use_ddp: bool = False
+    """If True, use standard PyTorch DDP instead of DeepSpeed for multi-GPU training."""
 
     max_steps: int = 10000
     """Total number of training steps to run before stopping."""

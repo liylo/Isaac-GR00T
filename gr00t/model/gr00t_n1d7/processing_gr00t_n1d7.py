@@ -67,6 +67,10 @@ EMBODIMENT_TAG_TO_PROJECTOR_INDEX = {
     "unitree_g1_full_body_with_waist_height_nav_cmd": 25,
     "unitree_g1_sonic": 11,
     "unitree_g1_sonic_human": 13,
+    "unitree_g1_sonic_endpose": 11,
+    "unitree_g1_sonic_token_endpose": 11,
+    "unitree_g1_sonic_human_endpose": 11,
+    "unitree_g1_sonic_human_token_endpose": 11,
     "unitree_g1_smpl": 12,
     "simpler_env_google": 0,
     "simpler_env_widowx": 1,
@@ -300,15 +304,12 @@ class Gr00tN1d7Processor(BaseProcessor):
         """Undo action normalization and convert relative actions to absolute."""
         # Split concatenated action into joint groups
         out_dict = {}
-        start_idx = 0
         joint_groups = self.modality_configs[embodiment_tag.value]["action"].modality_keys
         action_horizon = len(self.modality_configs[embodiment_tag.value]["action"].delta_indices)
+        action_slices = self.state_action_processor.get_action_slices(embodiment_tag.value)
         for key in joint_groups:
-            joint_dim = self.state_action_processor.norm_params[embodiment_tag.value]["action"][
-                key
-            ]["dim"].item()
-            out_dict[key] = action[..., :action_horizon, start_idx : start_idx + joint_dim]
-            start_idx += joint_dim
+            start_idx, end_idx = action_slices[key]
+            out_dict[key] = action[..., :action_horizon, start_idx:end_idx]
 
         # Use StateActionProcessor to unnormalize and convert to absolute
         return self.state_action_processor.unapply_action(
@@ -334,15 +335,12 @@ class Gr00tN1d7Processor(BaseProcessor):
             Dict mapping "action.<key>" to unnormalized (absolute) action arrays.
         """
         out_dict = {}
-        start_idx = 0
         joint_groups = self.modality_configs[embodiment_tag.value]["action"].modality_keys
         action_horizon = len(self.modality_configs[embodiment_tag.value]["action"].delta_indices)
+        action_slices = self.state_action_processor.get_action_slices(embodiment_tag.value)
         for key in joint_groups:
-            joint_dim = self.state_action_processor.norm_params[embodiment_tag.value]["action"][
-                key
-            ]["dim"].item()
-            out_dict[key] = action[..., :action_horizon, start_idx : start_idx + joint_dim]
-            start_idx += joint_dim
+            start_idx, end_idx = action_slices[key]
+            out_dict[key] = action[..., :action_horizon, start_idx:end_idx]
 
         # Strip "state." prefix for StateActionProcessor
         stripped_state = None
@@ -353,6 +351,73 @@ class Gr00tN1d7Processor(BaseProcessor):
             out_dict, embodiment_tag.value, state=stripped_state
         )
         return {f"action.{key}": value for key, value in result.items()}
+
+    def _pack_actions(
+        self,
+        normalized_actions: dict[str, np.ndarray],
+        embodiment_tag: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pack actions plus loss and auxiliary-branch masks into model-space slots."""
+        action_keys = self.modality_configs[embodiment_tag]["action"].modality_keys
+        action_configs = self.modality_configs[embodiment_tag]["action"].action_configs
+        action_slices = self.state_action_processor.get_action_slices(embodiment_tag)
+        action_dim = self.state_action_processor.get_action_dim(embodiment_tag)
+        if action_dim > self.max_action_dim:
+            raise ValueError(
+                f"Action layout for '{embodiment_tag}' requires {action_dim} dims, "
+                f"but max_action_dim is {self.max_action_dim}"
+            )
+
+        horizons = {values.shape[0] for values in normalized_actions.values()}
+        if len(horizons) != 1:
+            raise ValueError(f"Action groups must share one horizon, got {sorted(horizons)}")
+        action_horizon = horizons.pop()
+        action_tensor = torch.zeros(action_horizon, self.max_action_dim)
+        action_mask = torch.zeros_like(action_tensor)
+        auxiliary_action_mask = torch.zeros_like(action_tensor)
+        for key_index, key in enumerate(action_keys):
+            start_idx, end_idx = action_slices[key]
+            values = torch.from_numpy(normalized_actions[key])
+            if values.shape != (action_horizon, end_idx - start_idx):
+                raise ValueError(
+                    f"Action '{key}' has shape {tuple(values.shape)}, expected "
+                    f"({action_horizon}, {end_idx - start_idx})"
+                )
+            action_tensor[:, start_idx:end_idx] = values
+            loss_weight = 1.0
+            if action_configs is not None:
+                loss_weight = action_configs[key_index].loss_weight
+            action_mask[:, start_idx:end_idx] = loss_weight
+            if action_configs is not None and action_configs[key_index].is_auxiliary:
+                auxiliary_action_mask[:, start_idx:end_idx] = 1.0
+        return action_tensor, action_mask, auxiliary_action_mask
+
+    def _build_primary_action_mask(self, embodiment_tag: str) -> torch.Tensor:
+        """Return the token/primary slots that may participate in policy sampling."""
+        action_config = self.modality_configs[embodiment_tag]["action"]
+        action_slices = self.state_action_processor.get_action_slices(embodiment_tag)
+        per_key_configs = action_config.action_configs
+        if per_key_configs is None:
+            per_key_configs = [None] * len(action_config.modality_keys)
+
+        primary_mask = torch.zeros(self.max_action_horizon, self.max_action_dim)
+        for key, key_config in zip(action_config.modality_keys, per_key_configs):
+            if key_config is not None and key_config.is_auxiliary:
+                continue
+            offsets = (
+                key_config.delta_indices
+                if key_config is not None and key_config.delta_indices is not None
+                else action_config.delta_indices
+            )
+            horizon = len(offsets)
+            if horizon > self.max_action_horizon:
+                raise ValueError(
+                    f"Primary action '{key}' horizon {horizon} exceeds "
+                    f"max_action_horizon {self.max_action_horizon}"
+                )
+            start_idx, end_idx = action_slices[key]
+            primary_mask[:horizon, start_idx:end_idx] = 1.0
+        return primary_mask
 
     def process_observation(self, observation: dict[str, Any], embodiment_tag: EmbodimentTag):
         """Process batched observation tensors for inference.
@@ -452,6 +517,9 @@ class Gr00tN1d7Processor(BaseProcessor):
         if action_horizon > 0:
             action_mask[:, :action_horizon] = 1.0
         transformed_observation["action_mask"] = action_mask
+        transformed_observation["primary_action_mask"] = self._build_primary_action_mask(
+            embodiment_tag.value
+        ).unsqueeze(0).expand(B, -1, -1)
 
         return BatchFeature(transformed_observation)
 
@@ -508,26 +576,11 @@ class Gr00tN1d7Processor(BaseProcessor):
         )
 
         if normalized_actions:
-            # Concatenate actions
-            action_keys = self.modality_configs[embodiment_tag.value]["action"].modality_keys
-            normalized_actions = torch.cat(
-                [torch.from_numpy(normalized_actions[key]) for key in action_keys],
-                dim=-1,
-            )  # (t, d)
-            action_dim = normalized_actions.shape[1]
-            # Pad action to max_action_dim
-            normalized_actions = torch.cat(
-                [
-                    normalized_actions,
-                    torch.zeros(
-                        normalized_actions.shape[0],
-                        self.max_action_dim - normalized_actions.shape[1],
-                    ),
-                ],
-                dim=-1,
-            )  # (t, max_action_dim)
-            # Pad action to max_action_horizon
+            normalized_actions, action_mask, auxiliary_action_mask = self._pack_actions(
+                normalized_actions, embodiment_tag.value
+            )
             action_horizon = normalized_actions.shape[0]
+            # Pad action to max_action_horizon
             assert action_horizon <= self.max_action_horizon, (
                 f"Action sequence length {action_horizon} exceeds max_action_horizon"
                 f" {self.max_action_horizon}. Increase model config action_horizon to"
@@ -543,14 +596,31 @@ class Gr00tN1d7Processor(BaseProcessor):
                 ],
                 dim=0,
             )  # (max_action_horizon, max_action_dim)
-            # Create action mask
-            action_mask = torch.ones_like(normalized_actions)
-            action_mask[action_horizon:] = 0
-            action_mask[:, action_dim:] = 0
+            action_mask = torch.cat(
+                [
+                    action_mask,
+                    torch.zeros(
+                        self.max_action_horizon - action_horizon,
+                        self.max_action_dim,
+                    ),
+                ],
+                dim=0,
+            )
+            auxiliary_action_mask = torch.cat(
+                [
+                    auxiliary_action_mask,
+                    torch.zeros(
+                        self.max_action_horizon - action_horizon,
+                        self.max_action_dim,
+                    ),
+                ],
+                dim=0,
+            )
         else:
             assert not self.training, "Action is required in training mode"
             normalized_actions = None
             action_mask = None
+            auxiliary_action_mask = None
 
         # Concatenate states with optional dropout/noise augmentation
         state_keys = self.modality_configs[embodiment_tag.value]["state"].modality_keys
@@ -610,6 +680,13 @@ class Gr00tN1d7Processor(BaseProcessor):
         transformed_inputs.update(vlm_inputs)
         if action_mask is not None:
             transformed_inputs["action_mask"] = action_mask
+        if auxiliary_action_mask is not None:
+            transformed_inputs["auxiliary_action_mask"] = auxiliary_action_mask
+        # In primary+EEF checkpoints, inference uses this binary mask to keep
+        # auxiliary slots at zero throughout token flow sampling.
+        transformed_inputs["primary_action_mask"] = self._build_primary_action_mask(
+            embodiment_tag.value
+        )
         transformed_inputs["embodiment_id"] = self.embodiment_id_mapping[embodiment_tag.value]
         return transformed_inputs
 

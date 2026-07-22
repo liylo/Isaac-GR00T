@@ -20,6 +20,7 @@ Uses the fixture configs in tests/fixtures/processor_config/ with a mocked VLM
 processor (no model download needed).
 """
 
+from copy import deepcopy
 import json
 from pathlib import Path
 import tempfile
@@ -30,6 +31,7 @@ from gr00t.data.types import MessageType, VLAStepData
 import numpy as np
 from PIL import Image
 import pytest
+import torch
 
 
 FIXTURE_DIR = Path(__file__).parent.parent.parent / "fixtures" / "processor_config"
@@ -105,6 +107,7 @@ class TestProcessorCall:
         assert "action" in result
         assert "embodiment_id" in result
         assert "action_mask" in result
+        assert "primary_action_mask" in result
 
     def test_state_padded_to_max_dim(self, processor, proc_config):
         step_data = _make_step_data(proc_config)
@@ -127,12 +130,27 @@ class TestProcessorCall:
         messages = [{"type": MessageType.EPISODE_STEP.value, "content": step_data}]
         result = processor(messages)
         assert result["action_mask"].shape == result["action"].shape
+        assert result["primary_action_mask"].shape == result["action"].shape
 
     def test_embodiment_id_is_integer(self, processor, proc_config):
         step_data = _make_step_data(proc_config)
         messages = [{"type": MessageType.EPISODE_STEP.value, "content": step_data}]
         result = processor(messages)
         assert isinstance(result["embodiment_id"], (int, np.integer))
+
+    def test_inference_without_actions_still_emits_primary_sampling_mask(
+        self, processor, proc_config
+    ):
+        step_data = _make_step_data(proc_config)
+        step_data.actions = None
+        messages = [{"type": MessageType.EPISODE_STEP.value, "content": step_data}]
+        result = processor(messages)
+        assert "action" not in result
+        assert "action_mask" not in result
+        assert result["primary_action_mask"].shape == (
+            processor.max_action_horizon,
+            processor.max_action_dim,
+        )
 
 
 class TestProcessorVLMInputs:
@@ -188,6 +206,174 @@ class TestProcessorStatistics:
         processor.eval()
         assert processor.training is False
         assert processor.state_action_processor.training is False
+
+
+class TestFixedActionLayout:
+    def test_pack_actions_masks_only_configured_slots(self):
+        from gr00t.data.state_action.state_action_processor import StateActionProcessor
+        from gr00t.data.types import (
+            ActionConfig,
+            ActionFormat,
+            ActionRepresentation,
+            ActionType,
+            ModalityConfig,
+        )
+        from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
+
+        tag = "layout_test"
+        configs = {
+            tag: {
+                "state": ModalityConfig(delta_indices=[0], modality_keys=["joints"]),
+                "action": ModalityConfig(
+                    delta_indices=[0, 1],
+                    modality_keys=["eef"],
+                    action_configs=[
+                        ActionConfig(
+                            ActionRepresentation.RELATIVE,
+                            ActionType.EEF,
+                            ActionFormat.XYZ_ROT6D,
+                            model_offset=78,
+                            loss_weight=2.0,
+                        )
+                    ],
+                ),
+            }
+        }
+        stat = {
+            name: [value] * 9
+            for name, value in {
+                "mean": 0.0,
+                "std": 1.0,
+                "min": -1.0,
+                "max": 1.0,
+                "q01": -1.0,
+                "q99": 1.0,
+            }.items()
+        }
+        state_action_processor = StateActionProcessor(
+            modality_configs=configs,
+            statistics={tag: {"state": {}, "action": {"eef": stat}}},
+        )
+        processor = object.__new__(Gr00tN1d7Processor)
+        processor.modality_configs = configs
+        processor.state_action_processor = state_action_processor
+        processor.max_action_dim = 132
+
+        values = np.ones((2, 9), dtype=np.float32)
+        packed, mask, auxiliary_mask = processor._pack_actions({"eef": values}, tag)
+        assert packed.shape == (2, 132)
+        assert torch.count_nonzero(packed[:, :78]) == 0
+        assert torch.all(packed[:, 78:87] == 1)
+        assert torch.count_nonzero(packed[:, 87:]) == 0
+        assert torch.count_nonzero(mask[:, :78]) == 0
+        assert torch.all(mask[:, 78:87] == 2)
+        assert torch.count_nonzero(mask[:, 87:]) == 0
+        assert torch.count_nonzero(auxiliary_mask) == 0
+
+    @pytest.mark.parametrize(
+        ("tag", "include_token"),
+        [
+            ("unitree_g1_sonic_endpose", False),
+            ("unitree_g1_sonic_token_endpose", True),
+            ("unitree_g1_sonic_human_endpose", False),
+            ("unitree_g1_sonic_human_token_endpose", True),
+        ],
+    )
+    def test_sonic_endpose_tags_share_timing_slots_and_projector(self, tag, include_token):
+        from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+        from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import EMBODIMENT_TAG_TO_PROJECTOR_INDEX
+
+        config = MODALITY_CONFIGS[tag]
+        action_config_by_key = dict(
+            zip(config["action"].modality_keys, config["action"].action_configs)
+        )
+        endpose_keys = config["state"].reference_only_keys
+
+        assert EMBODIMENT_TAG_TO_PROJECTOR_INDEX[tag] == 11
+        assert len(endpose_keys) == 4
+        for index, key in enumerate(endpose_keys):
+            action_config = action_config_by_key[key]
+            assert action_config.delta_indices == list(range(1, 41))
+            assert action_config.model_offset == 78 + 9 * index
+            assert action_config.loss_weight == 1.0
+            assert action_config.decode_to_absolute is False
+            assert action_config.is_auxiliary is True
+
+        token_keys = ["motion_token", "left_hand_joints", "right_hand_joints"]
+        if include_token:
+            assert config["action"].modality_keys[:3] == token_keys
+            assert [action_config_by_key[key].model_offset for key in token_keys] == [0, 64, 71]
+            assert all(action_config_by_key[key].loss_weight == 1.0 for key in token_keys)
+        else:
+            assert not set(token_keys) & set(config["action"].modality_keys)
+
+    @pytest.mark.parametrize(
+        ("tag", "include_token"),
+        [
+            ("unitree_g1_sonic_endpose", False),
+            ("unitree_g1_sonic_token_endpose", True),
+            ("unitree_g1_sonic_human_endpose", False),
+            ("unitree_g1_sonic_human_token_endpose", True),
+        ],
+    )
+    def test_sonic_xyz_only_keeps_limb_lanes(self, tag, include_token):
+        from gr00t.configs.data.embodiment_configs import (
+            MODALITY_CONFIGS,
+            enable_sonic_endpose_xyz_only,
+        )
+        from gr00t.data.types import ActionFormat, ActionType
+
+        config = deepcopy(MODALITY_CONFIGS[tag])
+        enable_sonic_endpose_xyz_only(config)
+        configs = config["action"].action_configs
+        eef_configs = [item for item in configs if item.type is ActionType.EEF]
+
+        assert len(eef_configs) == 4
+        assert [item.model_offset for item in eef_configs] == [78, 87, 96, 105]
+        assert all(item.format is ActionFormat.XYZ for item in eef_configs)
+        assert all(item.decode_to_absolute is False for item in eef_configs)
+
+        token_configs = [item for item in configs if item.type is ActionType.NON_EEF]
+        if include_token:
+            assert len(token_configs) == 3
+            assert all(item.loss_weight == 1.0 for item in token_configs)
+        else:
+            assert token_configs == []
+
+    @pytest.mark.parametrize(
+        ("tag", "expected_primary_dims"),
+        [
+            ("unitree_g1_sonic_endpose", 0),
+            ("unitree_g1_sonic_token_endpose", 78),
+            ("unitree_g1_sonic_human_endpose", 0),
+            ("unitree_g1_sonic_human_token_endpose", 78),
+        ],
+    )
+    def test_primary_sampling_mask_excludes_auxiliary_slots(self, tag, expected_primary_dims):
+        from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+        from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
+
+        config = MODALITY_CONFIGS[tag]
+        processor = object.__new__(Gr00tN1d7Processor)
+        processor.modality_configs = {tag: config}
+        processor.max_action_horizon = 40
+        processor.max_action_dim = 132
+        processor.state_action_processor = MagicMock()
+        processor.state_action_processor.get_action_slices.return_value = {
+            key: (
+                action_config.model_offset,
+                action_config.model_offset
+                + (64 if key == "motion_token" else 7 if "hand_joints" in key else 9),
+            )
+            for key, action_config in zip(
+                config["action"].modality_keys, config["action"].action_configs
+            )
+        }
+
+        mask = processor._build_primary_action_mask(tag)
+        assert mask.shape == (40, 132)
+        assert torch.count_nonzero(mask[0]) == expected_primary_dims
+        assert torch.count_nonzero(mask[:, 78:]) == 0
 
 
 class TestFixtureCompleteness:

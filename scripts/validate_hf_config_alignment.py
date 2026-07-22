@@ -352,7 +352,7 @@ def check_dim_j_enum_serialization():
     modality_configs = load_modality_configs()
     valid_rep_names = {"RELATIVE", "ABSOLUTE"}
     valid_type_names = {"EEF", "NON_EEF"}
-    valid_format_names = {"DEFAULT", "XYZ_ROT6D", "ROTATION_6D", "SCALAR"}
+    valid_format_names = {"DEFAULT", "XYZ", "XYZ_ROT6D", "ROTATION_6D", "SCALAR"}
 
     for tag, cfg in modality_configs.items():
         action_configs = cfg.get("action", {}).get("action_configs")

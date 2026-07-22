@@ -89,6 +89,7 @@ class TrainingConfig:
     # DDP
     use_ddp: bool = False
     ddp_bucket_cap_mb: int = 100
+    ddp_find_unused_parameters: bool = False
 
     # Hardware
     num_gpus: int = 1

@@ -16,6 +16,7 @@
 # Launch finetuning for N1.7 on "single node".
 # This script tries to provide a similar user experience as current OSS.
 
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -72,6 +73,36 @@ if __name__ == "__main__":
     )
     config.load_config_path = None
 
+    if ft_config.endpose_xyz_only:
+        from gr00t.configs.data.embodiment_configs import enable_sonic_endpose_xyz_only
+
+        selected_modality_config = deepcopy(config.data.modality_configs[embodiment_tag])
+        enable_sonic_endpose_xyz_only(selected_modality_config)
+        config.data.modality_configs[embodiment_tag] = selected_modality_config
+        print(f"Enabled xyz-only endpose supervision for {embodiment_tag}")
+
+    selected_action_configs = config.data.modality_configs[embodiment_tag][
+        "action"
+    ].action_configs
+    # Legacy modality configs do not define per-key ActionConfig entries; they
+    # use the original primary action flow branch.
+    has_auxiliary_actions = bool(selected_action_configs) and any(
+        item.is_auxiliary for item in selected_action_configs
+    )
+    has_primary_actions = not selected_action_configs or any(
+        not item.is_auxiliary for item in selected_action_configs
+    )
+    if has_auxiliary_actions and has_primary_actions:
+        config.model.action_branch_mode = "primary_eef"
+    elif has_auxiliary_actions:
+        config.model.action_branch_mode = "eef"
+    else:
+        config.model.action_branch_mode = "primary"
+    # Mixed primary/EEF batches can legitimately leave one task adapter unused
+    # on a rank. EEF-only freezes the primary adapters explicitly below.
+    config.training.ddp_find_unused_parameters = config.model.action_branch_mode == "primary_eef"
+    print(f"Action branch mode: {config.model.action_branch_mode}")
+
     # overwrite with finetune config supplied by the user
     config.model.tune_llm = ft_config.tune_llm
     config.model.tune_visual = ft_config.tune_visual
@@ -90,6 +121,7 @@ if __name__ == "__main__":
     config.model.model_name = "nvidia/Cosmos-Reason2-2B"
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
+    config.model.auxiliary_action_loss_weight = ft_config.endpose_loss_weight
     if ft_config.embodiment_tag is EmbodimentTag.UNITREE_G1_SMPL:
         config.model.action_horizon = len(
             config.data.modality_configs[embodiment_tag]["action"].delta_indices
@@ -107,6 +139,7 @@ if __name__ == "__main__":
     config.training.save_total_limit = ft_config.save_total_limit
     config.training.num_gpus = ft_config.num_gpus
     config.training.use_wandb = ft_config.use_wandb
+    config.training.use_ddp = ft_config.use_ddp
     config.training.max_steps = ft_config.max_steps
     config.training.weight_decay = ft_config.weight_decay
     config.training.warmup_ratio = ft_config.warmup_ratio

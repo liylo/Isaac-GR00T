@@ -74,6 +74,17 @@ class TestEndEffectorPoseFromActionFormat:
             reconstructed.rotation_matrix, original.rotation_matrix, atol=1e-6
         )
 
+    def test_xyz_quat(self):
+        original = _random_pose()
+        flat = original.xyz_quat_wxyz
+        reconstructed = EndEffectorPose.from_action_format(flat, ActionFormat.XYZ_QUAT)
+
+        assert flat[3] >= 0
+        np.testing.assert_allclose(reconstructed.translation, original.translation, atol=1e-6)
+        np.testing.assert_allclose(
+            reconstructed.rotation_matrix, original.rotation_matrix, atol=1e-6
+        )
+
     def test_default_homogeneous(self):
         original = _random_pose()
         flat = original.homogeneous.flatten()  # shape (16,)
@@ -102,6 +113,7 @@ class TestEndEffectorActionChunkFromArray:
         [
             (ActionFormat.XYZ_ROT6D, 9),
             (ActionFormat.XYZ_ROTVEC, 6),
+            (ActionFormat.XYZ_QUAT, 7),
         ],
     )
     def test_from_array_creates_correct_length(self, action_format, dim):
@@ -131,6 +143,7 @@ class TestEndEffectorActionChunkFromArray:
         [
             (ActionFormat.XYZ_ROT6D, 9),
             (ActionFormat.XYZ_ROTVEC, 6),
+            (ActionFormat.XYZ_QUAT, 7),
         ],
     )
     def test_from_array_roundtrip(self, action_format, dim):
@@ -155,7 +168,7 @@ class TestEefRoundtrip:
 
     @pytest.mark.parametrize(
         "action_format",
-        [ActionFormat.XYZ_ROT6D, ActionFormat.XYZ_ROTVEC],
+        [ActionFormat.XYZ_ROT6D, ActionFormat.XYZ_ROTVEC, ActionFormat.XYZ_QUAT],
     )
     def test_absolute_relative_absolute_roundtrip(self, action_format):
         """Convert to relative and back; the result should match the original."""
@@ -177,16 +190,18 @@ class TestEefRoundtrip:
 
     @pytest.mark.parametrize(
         "action_format",
-        [ActionFormat.XYZ_ROT6D, ActionFormat.XYZ_ROTVEC],
+        [ActionFormat.XYZ_ROT6D, ActionFormat.XYZ_ROTVEC, ActionFormat.XYZ_QUAT],
     )
     def test_roundtrip_via_flat_arrays(self, action_format):
         """Full pipeline: array -> from_array -> relative -> to -> from_array -> absolute -> to."""
         reference = _random_pose()
         absolute_poses = [_random_pose() for _ in range(4)]
         original_array = EndEffectorActionChunk(absolute_poses).to(action_format)
-        ref_flat = (
-            reference.xyz_rot6d if action_format == ActionFormat.XYZ_ROT6D else reference.xyz_rotvec
-        )
+        ref_flat = {
+            ActionFormat.XYZ_ROT6D: reference.xyz_rot6d,
+            ActionFormat.XYZ_ROTVEC: reference.xyz_rotvec,
+            ActionFormat.XYZ_QUAT: reference.xyz_quat_wxyz,
+        }[action_format]
 
         # Reconstruct from flat arrays, compute relative, serialize
         abs_chunk = EndEffectorActionChunk.from_array(original_array, action_format)

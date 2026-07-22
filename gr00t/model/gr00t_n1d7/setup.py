@@ -31,6 +31,20 @@ from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
 from gr00t.model.registry import register_model
 
 
+EEF_ACTION_BRANCH_KEYS = {
+    "action_head.eef_action_encoder.W1.W",
+    "action_head.eef_action_encoder.W1.b",
+    "action_head.eef_action_encoder.W2.W",
+    "action_head.eef_action_encoder.W2.b",
+    "action_head.eef_action_encoder.W3.W",
+    "action_head.eef_action_encoder.W3.b",
+    "action_head.eef_action_decoder.layer1.W",
+    "action_head.eef_action_decoder.layer1.b",
+    "action_head.eef_action_decoder.layer2.W",
+    "action_head.eef_action_decoder.layer2.b",
+}
+
+
 # Convert tensors to lists for JSON serialization
 def convert_tensors_to_lists(obj):
     """Recursively convert tensors to lists in nested dictionaries/lists."""
@@ -122,12 +136,37 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
+                action_branch_mode=self.config.model.action_branch_mode,
+                auxiliary_action_loss_weight=self.config.model.auxiliary_action_loss_weight,
+                auxiliary_action_init_category=self.config.model.auxiliary_action_init_category,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
                 **self.transformers_loading_kwargs,
             )
 
             missing_keys = loading_info.get("missing_keys", [])
+            expected_eef_keys = (
+                EEF_ACTION_BRANCH_KEYS
+                if model.config.action_branch_mode in {"eef", "primary_eef"}
+                else set()
+            )
+            missing_eef_keys = {
+                key
+                for key in missing_keys
+                if key.startswith(
+                    ("action_head.eef_action_encoder.", "action_head.eef_action_decoder.")
+                )
+            }
+            if missing_eef_keys == expected_eef_keys and expected_eef_keys:
+                model.action_head.initialize_eef_branch_from_primary()
+                logging.info(
+                    "EEF action branch not in checkpoint - initialized from primary "
+                    f"category {model.config.auxiliary_action_init_category}"
+                )
+            elif missing_eef_keys:
+                logging.error(
+                    "Checkpoint contains a partial EEF action branch; refusing to overwrite it"
+                )
             mask_token_missing = any("mask_token" in key for key in missing_keys)
             if mask_token_missing and model.action_head.mask_token is not None:
                 with torch.no_grad():
@@ -137,13 +176,31 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 logging.info("mask_token not in checkpoint - initialized")
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
+            unexpected_eef_keys = {
+                key for key in unexpected_keys if key in EEF_ACTION_BRANCH_KEYS
+            }
+            allowed_unexpected = set()
+            if (
+                model.config.action_branch_mode == "primary"
+                and unexpected_eef_keys == EEF_ACTION_BRANCH_KEYS
+            ):
+                allowed_unexpected = unexpected_eef_keys
+                logging.info("Discarded checkpoint EEF branch for primary-only downstream task")
             mismatched_keys = loading_info.get("mismatched_keys", [])
-            other_missing = [k for k in missing_keys if "mask_token" not in k]
+            allowed_missing = missing_eef_keys if missing_eef_keys == expected_eef_keys else set()
+            other_missing = [
+                key
+                for key in missing_keys
+                if "mask_token" not in key and key not in allowed_missing
+            ]
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")
-            if unexpected_keys:
-                errors.append(f"Unexpected keys ({len(unexpected_keys)}): {unexpected_keys}")
+            other_unexpected = [key for key in unexpected_keys if key not in allowed_unexpected]
+            if other_unexpected:
+                errors.append(
+                    f"Unexpected keys ({len(other_unexpected)}): {other_unexpected}"
+                )
             if mismatched_keys:
                 errors.append(f"Mismatched keys ({len(mismatched_keys)}): {mismatched_keys}")
             if errors:
