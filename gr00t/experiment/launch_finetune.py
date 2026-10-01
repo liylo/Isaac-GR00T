@@ -18,6 +18,7 @@
 
 from copy import deepcopy
 import json
+import math
 import os
 from pathlib import Path
 
@@ -40,6 +41,32 @@ def load_modality_config(modality_config_path: str):
         print(f"Loaded modality config: {path}")
     else:
         raise FileNotFoundError(f"Modality config path does not exist: {modality_config_path}")
+
+
+def compute_completion_pos_weight(dataset_path: str, window_frames: int) -> float:
+    """Compute natural-distribution negative/positive ratio from LeRobot metadata."""
+    if window_frames <= 0:
+        raise ValueError("task_status_completion_window_frames must be positive")
+    episodes_path = Path(dataset_path) / "meta" / "episodes.jsonl"
+    if not episodes_path.is_file():
+        raise FileNotFoundError(
+            f"Automatic task-status pos_weight requires LeRobot episode metadata at {episodes_path}"
+        )
+
+    lengths = []
+    with open(episodes_path) as f:
+        for line in f:
+            if line.strip():
+                lengths.append(int(json.loads(line)["length"]))
+    if not lengths:
+        raise ValueError(f"No episodes found in {episodes_path}")
+
+    positive_frames = sum(min(window_frames, max(length - 1, 0)) for length in lengths)
+    total_frames = sum(lengths)
+    negative_frames = total_frames - positive_frames
+    if positive_frames <= 0 or negative_frames <= 0:
+        raise ValueError("Completion window must leave both positive and negative status examples")
+    return negative_frames / positive_frames
 
 
 if __name__ == "__main__":
@@ -81,9 +108,7 @@ if __name__ == "__main__":
         config.data.modality_configs[embodiment_tag] = selected_modality_config
         print(f"Enabled xyz-only endpose supervision for {embodiment_tag}")
 
-    selected_action_configs = config.data.modality_configs[embodiment_tag][
-        "action"
-    ].action_configs
+    selected_action_configs = config.data.modality_configs[embodiment_tag]["action"].action_configs
     # Legacy modality configs do not define per-key ActionConfig entries; they
     # use the original primary action flow branch.
     has_auxiliary_actions = bool(selected_action_configs) and any(
@@ -122,6 +147,58 @@ if __name__ == "__main__":
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
     config.model.auxiliary_action_loss_weight = ft_config.endpose_loss_weight
+    config.model.task_status_head_enabled = ft_config.task_status_head
+    config.model.task_status_head_only = (
+        ft_config.task_status_head and ft_config.task_status_head_only
+    )
+    config.model.task_status_hidden_dim = ft_config.task_status_hidden_dim
+    config.model.task_status_num_heads = ft_config.task_status_num_heads
+    config.model.task_status_completion_window_frames = (
+        ft_config.task_status_completion_window_frames
+    )
+    config.model.task_status_completion_threshold = ft_config.task_status_completion_threshold
+    config.model.task_status_progress_threshold = ft_config.task_status_progress_threshold
+    config.model.task_status_consecutive_steps = ft_config.task_status_consecutive_steps
+    if ft_config.task_status_head:
+        if not ft_config.task_status_head_only:
+            raise ValueError(
+                "Joint task-status/action finetuning is not supported by this launcher: "
+                "terminal action padding would create invalid action supervision"
+            )
+        for name, value in (
+            ("task_status_completion_threshold", ft_config.task_status_completion_threshold),
+            ("task_status_progress_threshold", ft_config.task_status_progress_threshold),
+        ):
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be finite and in [0, 1], got {value}")
+        if ft_config.task_status_consecutive_steps <= 0:
+            raise ValueError("task_status_consecutive_steps must be positive")
+        pos_weight = ft_config.task_status_completion_pos_weight
+        if pos_weight is None:
+            pos_weight = compute_completion_pos_weight(
+                ft_config.dataset_path,
+                ft_config.task_status_completion_window_frames,
+            )
+        if not math.isfinite(pos_weight) or pos_weight <= 0:
+            raise ValueError("task_status_completion_pos_weight must be positive")
+        config.model.task_status_completion_pos_weight = pos_weight
+        # The terminal observations must not be truncated by the action horizon.
+        config.data.allow_padding = True
+        print(
+            "Task-status head enabled: "
+            f"window={ft_config.task_status_completion_window_frames} frames, "
+            f"completion_pos_weight={pos_weight:.4f}"
+        )
+    if config.model.task_status_head_only:
+        # Keep the pretrained policy intact and optimize only the fresh status head.
+        config.model.tune_llm = False
+        config.model.tune_visual = False
+        config.model.tune_top_llm_layers = 0
+        config.model.tune_projector = False
+        config.model.tune_diffusion_model = False
+        config.model.tune_vlln = False
+        config.training.ddp_find_unused_parameters = False
+        print("Task-status-only mode: froze backbone and action head")
     if ft_config.embodiment_tag is EmbodimentTag.UNITREE_G1_SMPL:
         config.model.action_horizon = len(
             config.data.modality_configs[embodiment_tag]["action"].delta_indices

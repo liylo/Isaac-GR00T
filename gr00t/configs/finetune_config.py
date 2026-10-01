@@ -63,6 +63,33 @@ class FinetuneConfig:
     tune_diffusion_model: bool = True
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
 
+    task_status_head: bool = False
+    """Add a completion/progress head to the VLM backbone features."""
+
+    task_status_head_only: bool = True
+    """Freeze the existing VLA and train only the task-status head."""
+
+    task_status_hidden_dim: int = 512
+    """Hidden dimension of the task-status MLP after attention pooling."""
+
+    task_status_num_heads: int = 8
+    """Number of attention heads used to pool VLM tokens."""
+
+    task_status_completion_window_frames: int = 25
+    """Number of final episode frames labeled complete (25 frames is 0.5 s at 50 Hz)."""
+
+    task_status_completion_pos_weight: float | None = None
+    """Positive BCE weight; when omitted it is computed from dataset episode lengths."""
+
+    task_status_completion_threshold: float = 0.5
+    """Inference completion threshold used by the policy done detector."""
+
+    task_status_progress_threshold: float = 0.9
+    """Inference progress threshold used by the policy done detector."""
+
+    task_status_consecutive_steps: int = 1
+    """Required positive policy calls; use 1 for a terminal window shorter than one action chunk."""
+
     state_dropout_prob: float = 0.2
     """
     Dropout probability applied to state inputs for regularization during training.

@@ -220,3 +220,25 @@ class TestGr00tN1d7Config:
 
         parsed = json.loads(j)
         assert parsed["model_type"] == "Gr00tN1d7"
+
+
+def test_task_status_head_only_freezes_existing_action_policy():
+    config = _make_small_config(
+        task_status_head_enabled=True,
+        task_status_head_only=True,
+        task_status_hidden_dim=32,
+        task_status_num_heads=4,
+        # Even contradictory tune flags cannot override head-only semantics.
+        tune_projector=True,
+        tune_diffusion_model=True,
+        tune_vlln=True,
+    )
+    with patch("gr00t.model.gr00t_n1d7.gr00t_n1d7.get_backbone_cls") as mock_get_cls:
+        mock_get_cls.return_value = lambda **_kwargs: _make_mock_backbone(config)
+        with patch("gr00t.model.gr00t_n1d7.processing_gr00t_n1d7.build_processor"):
+            from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7
+
+            model = Gr00tN1d7(config)
+
+    assert not any(parameter.requires_grad for parameter in model.action_head.parameters())
+    assert all(parameter.requires_grad for parameter in model.task_status_head.parameters())

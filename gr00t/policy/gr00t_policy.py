@@ -32,6 +32,7 @@ from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.types import MessageType, ModalityConfig, VLAStepData
 
 from .policy import BasePolicy, PolicyWrapper
+from .task_status import TaskStatusDoneDetector
 
 
 def _rec_to_dtype(x: Any, dtype: torch.dtype) -> Any:
@@ -78,6 +79,7 @@ class Gr00tPolicy(BasePolicy):
         *,
         device: int | str,
         strict: bool = True,
+        enable_task_status_done_detector: bool = True,
     ):
         """Initialize the Gr00t Policy.
 
@@ -87,6 +89,8 @@ class Gr00tPolicy(BasePolicy):
             model_path: Path to the pretrained model checkpoint directory
             device: Device to run the model on (e.g., 'cuda:0', 0, 'cpu')
             strict: Whether to enforce strict input validation (default: True)
+            enable_task_status_done_detector: Whether to turn status predictions into a
+                consecutive-call ``done`` value in the returned info dictionary.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -101,6 +105,16 @@ class Gr00tPolicy(BasePolicy):
         model.eval()  # Set model to evaluation mode
         model.to(device=device, dtype=torch.bfloat16)
         self.model = model
+        self.task_status_done_detector = None
+        status_enabled = (
+            getattr(getattr(model, "config", None), "task_status_head_enabled", False) is True
+        )
+        if status_enabled and enable_task_status_done_detector:
+            self.task_status_done_detector = TaskStatusDoneDetector(
+                completion_threshold=getattr(model.config, "task_status_completion_threshold", 0.5),
+                progress_threshold=getattr(model.config, "task_status_progress_threshold", 0.9),
+                consecutive_steps=getattr(model.config, "task_status_consecutive_steps", 3),
+            )
 
         # Load the processor for input/output transformation.
         # Training saves processor files under a "processor/" subdirectory, but
@@ -420,7 +434,21 @@ class Gr00tPolicy(BasePolicy):
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        info = {}
+        for key in ("completion", "progress"):
+            if key in model_pred:
+                info[key] = (
+                    model_pred[key].detach().float().cpu().numpy().astype(np.float32, copy=False)
+                )
+        if self.task_status_done_detector is not None and {
+            "completion",
+            "progress",
+        }.issubset(info):
+            info["done"] = self.task_status_done_detector.update(
+                completion=info["completion"],
+                progress=info["progress"],
+            )
+        return casted_action, info
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.
@@ -479,6 +507,8 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             Dictionary containing the info after resetting the policy
         """
+        if self.task_status_done_detector is not None:
+            self.task_status_done_detector.reset()
         return {}
 
 

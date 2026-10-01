@@ -251,6 +251,11 @@ class ShardedSingleStepDataset(ShardedDataset):
     def get_effective_episode_length(self, episode_index: int) -> int:
         """Get the effective episode length accounting for action horizon."""
         original_length = self.episode_loader.get_episode_length(episode_index)
+        if self.allow_padding:
+            # Terminal observations are required for objectives such as task
+            # completion prediction. extract_step_data() will repeat the final
+            # action target for horizon offsets beyond the episode boundary.
+            return original_length
         return max(0, original_length - self.max_action_delta_index)
 
     def __len__(self):
@@ -282,9 +287,16 @@ class ShardedSingleStepDataset(ShardedDataset):
             self.embodiment_tag,
             self.allow_padding,
         )
-        # Apply processor to convert to model inputs
+        # Apply processor to convert to model inputs.
         messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
-        return self.processor(messages)
+        datapoint = self.processor(messages)
+
+        # Keep episode position as model inputs so auxiliary heads can construct
+        # self-supervised labels online without modifying the source dataset.
+        if hasattr(datapoint, "__setitem__"):
+            datapoint["frame_index"] = np.asarray(step_index, dtype=np.int64)
+            datapoint["episode_length"] = np.asarray(len(episode_data), dtype=np.int64)
+        return datapoint
 
     def get_shard_length(self, idx: int) -> int:
         """Get the number of timesteps in a specific shard."""

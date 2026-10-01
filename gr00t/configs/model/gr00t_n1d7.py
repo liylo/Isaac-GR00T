@@ -119,6 +119,24 @@ class Gr00tN1d7Config(PretrainedConfig):
     tune_diffusion_model: bool = True
     tune_vlln: bool = True
 
+    # Optional task-status head. The head predicts whether the current observation
+    # is in the terminal window and estimates normalized episode progress.
+    task_status_head_enabled: bool = False
+    task_status_head_only: bool = False
+    task_status_hidden_dim: int = 512
+    task_status_num_heads: int = 8
+    task_status_dropout: float = 0.0
+    task_status_completion_window_frames: int = 10
+    task_status_completion_pos_weight: float = 1.0
+    task_status_loss_weight: float = 1.0
+    task_status_completion_loss_weight: float = 1.0
+    task_status_progress_loss_weight: float = 1.0
+
+    # Defaults used by Gr00tPolicy's consecutive-call done detector.
+    task_status_completion_threshold: float = 0.5
+    task_status_progress_threshold: float = 0.9
+    task_status_consecutive_steps: int = 3
+
     # State augmentation parameters
     state_dropout_prob: float = 0.8  # State dropout probability
     exclude_state: bool = False  # Zero out all state inputs (ablation)

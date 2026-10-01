@@ -168,3 +168,19 @@ class TestGr00tPolicyGetAction:
         action, info = policy.get_action(obs)
         assert isinstance(action, dict)
         assert isinstance(info, dict)
+
+    def test_get_action_returns_task_status_tensors_in_info(self, policy):
+        policy.model.get_action.return_value = BatchFeature(
+            data={
+                "action_pred": torch.randn(1, 16, 7),
+                "completion": torch.tensor([0.75], dtype=torch.bfloat16),
+                "progress": torch.tensor([0.9375], dtype=torch.bfloat16),
+            }
+        )
+
+        _, info = policy.get_action(_make_observation())
+
+        np.testing.assert_array_equal(info["completion"], np.array([0.75], dtype=np.float32))
+        np.testing.assert_array_equal(info["progress"], np.array([0.9375], dtype=np.float32))
+        assert info["completion"].dtype == np.float32
+        assert info["progress"].dtype == np.float32

@@ -44,6 +44,20 @@ EEF_ACTION_BRANCH_KEYS = {
     "action_head.eef_action_decoder.layer2.b",
 }
 
+TASK_STATUS_HEAD_KEYS = {
+    "task_status_head.query",
+    "task_status_head.attention.in_proj_weight",
+    "task_status_head.attention.in_proj_bias",
+    "task_status_head.attention.out_proj.weight",
+    "task_status_head.attention.out_proj.bias",
+    "task_status_head.norm.weight",
+    "task_status_head.norm.bias",
+    "task_status_head.mlp.0.weight",
+    "task_status_head.mlp.0.bias",
+    "task_status_head.mlp.3.weight",
+    "task_status_head.mlp.3.bias",
+}
+
 
 # Convert tensors to lists for JSON serialization
 def convert_tensors_to_lists(obj):
@@ -132,6 +146,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 tune_projector=self.config.model.tune_projector,
                 tune_diffusion_model=self.config.model.tune_diffusion_model,
                 tune_vlln=self.config.model.tune_vlln,
+                tune_top_llm_layers=getattr(self.config.model, "tune_top_llm_layers", 0),
                 model_name=self.config.model.model_name,
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
@@ -139,6 +154,35 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 action_branch_mode=self.config.model.action_branch_mode,
                 auxiliary_action_loss_weight=self.config.model.auxiliary_action_loss_weight,
                 auxiliary_action_init_category=self.config.model.auxiliary_action_init_category,
+                task_status_head_enabled=getattr(
+                    self.config.model, "task_status_head_enabled", False
+                ),
+                task_status_head_only=getattr(self.config.model, "task_status_head_only", False),
+                task_status_hidden_dim=getattr(self.config.model, "task_status_hidden_dim", 512),
+                task_status_num_heads=getattr(self.config.model, "task_status_num_heads", 8),
+                task_status_dropout=getattr(self.config.model, "task_status_dropout", 0.0),
+                task_status_completion_window_frames=(
+                    getattr(self.config.model, "task_status_completion_window_frames", 10)
+                ),
+                task_status_completion_pos_weight=(
+                    getattr(self.config.model, "task_status_completion_pos_weight", 1.0)
+                ),
+                task_status_loss_weight=getattr(self.config.model, "task_status_loss_weight", 1.0),
+                task_status_completion_loss_weight=(
+                    getattr(self.config.model, "task_status_completion_loss_weight", 1.0)
+                ),
+                task_status_progress_loss_weight=(
+                    getattr(self.config.model, "task_status_progress_loss_weight", 1.0)
+                ),
+                task_status_completion_threshold=(
+                    getattr(self.config.model, "task_status_completion_threshold", 0.5)
+                ),
+                task_status_progress_threshold=getattr(
+                    self.config.model, "task_status_progress_threshold", 0.9
+                ),
+                task_status_consecutive_steps=getattr(
+                    self.config.model, "task_status_consecutive_steps", 3
+                ),
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
                 **self.transformers_loading_kwargs,
@@ -167,6 +211,28 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 logging.error(
                     "Checkpoint contains a partial EEF action branch; refusing to overwrite it"
                 )
+
+            expected_status_keys = set()
+            task_status_head = getattr(model, "task_status_head", None)
+            if task_status_head is not None:
+                expected_status_keys = {
+                    f"task_status_head.{key}" for key in task_status_head.state_dict()
+                }
+            missing_status_keys = {
+                key for key in missing_keys if key.startswith("task_status_head.")
+            }
+            allowed_status_missing = set()
+            if missing_status_keys == expected_status_keys and expected_status_keys:
+                allowed_status_missing = missing_status_keys
+                # Hugging Face disables normal torch initialization while loading a
+                # checkpoint. Explicitly initialize a head newly added to an older
+                # action-only checkpoint instead of retaining uninitialized memory.
+                task_status_head.reset_parameters()
+                logging.info("Task-status head not in checkpoint - explicitly initialized")
+            elif missing_status_keys:
+                logging.error(
+                    "Checkpoint contains a partial task-status head; refusing to ignore it"
+                )
             mask_token_missing = any("mask_token" in key for key in missing_keys)
             if mask_token_missing and model.action_head.mask_token is not None:
                 with torch.no_grad():
@@ -176,9 +242,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 logging.info("mask_token not in checkpoint - initialized")
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
-            unexpected_eef_keys = {
-                key for key in unexpected_keys if key in EEF_ACTION_BRANCH_KEYS
-            }
+            unexpected_eef_keys = {key for key in unexpected_keys if key in EEF_ACTION_BRANCH_KEYS}
             allowed_unexpected = set()
             if (
                 model.config.action_branch_mode == "primary"
@@ -186,8 +250,20 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             ):
                 allowed_unexpected = unexpected_eef_keys
                 logging.info("Discarded checkpoint EEF branch for primary-only downstream task")
+            unexpected_status_keys = {
+                key for key in unexpected_keys if key.startswith("task_status_head.")
+            }
+            if task_status_head is None and unexpected_status_keys == TASK_STATUS_HEAD_KEYS:
+                allowed_unexpected |= unexpected_status_keys
+                logging.info("Discarded checkpoint task-status head because it is disabled")
+            elif unexpected_status_keys:
+                logging.error(
+                    "Checkpoint contains an unexpected partial task-status head; refusing to ignore it"
+                )
             mismatched_keys = loading_info.get("mismatched_keys", [])
-            allowed_missing = missing_eef_keys if missing_eef_keys == expected_eef_keys else set()
+            allowed_missing = (
+                missing_eef_keys if missing_eef_keys == expected_eef_keys else set()
+            ) | allowed_status_missing
             other_missing = [
                 key
                 for key in missing_keys
@@ -198,9 +274,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")
             other_unexpected = [key for key in unexpected_keys if key not in allowed_unexpected]
             if other_unexpected:
-                errors.append(
-                    f"Unexpected keys ({len(other_unexpected)}): {other_unexpected}"
-                )
+                errors.append(f"Unexpected keys ({len(other_unexpected)}): {other_unexpected}")
             if mismatched_keys:
                 errors.append(f"Mismatched keys ({len(mismatched_keys)}): {mismatched_keys}")
             if errors:
@@ -208,6 +282,18 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     "Checkpoint weight mismatch for "
                     f"{self.config.training.start_from_checkpoint}:\n" + "\n".join(errors)
                 )
+
+            if task_status_head is not None:
+                non_finite_status_parameters = [
+                    name
+                    for name, parameter in task_status_head.named_parameters()
+                    if not torch.isfinite(parameter).all()
+                ]
+                if non_finite_status_parameters:
+                    raise RuntimeError(
+                        "Task-status checkpoint contains non-finite parameters: "
+                        f"{non_finite_status_parameters}"
+                    )
 
         else:
             model = self.model_class(

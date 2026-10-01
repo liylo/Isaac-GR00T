@@ -38,6 +38,118 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
 logger = logging.getLogger(__name__)
 
 
+class Gr00tTaskStatusHead(nn.Module):
+    """Attention-pool VLM tokens into completion and progress logits."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        hidden_dim: int = 512,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if embedding_dim <= 0 or hidden_dim <= 0:
+            raise ValueError("Task-status embedding and hidden dimensions must be positive")
+        if num_heads <= 0 or embedding_dim % num_heads != 0:
+            raise ValueError(
+                "task_status_num_heads must divide backbone_embedding_dim, got "
+                f"{num_heads} and {embedding_dim}"
+            )
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(f"task_status_dropout must be in [0, 1), got {dropout}")
+
+        self.query = nn.Parameter(torch.empty(1, 1, embedding_dim))
+        self.attention = nn.MultiheadAttention(
+            embed_dim=embedding_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm = nn.LayerNorm(embedding_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embedding_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2),
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize every status-head parameter, including missing checkpoint weights.
+
+        ``PreTrainedModel.from_pretrained`` may construct the model with torch's
+        initialization functions disabled. The pipeline therefore calls this method
+        again after it confirms that the whole head is absent from an older checkpoint.
+        """
+        nn.init.normal_(self.query, mean=0.0, std=0.02)
+        nn.init.xavier_uniform_(self.attention.in_proj_weight)
+        if self.attention.in_proj_bias is not None:
+            nn.init.zeros_(self.attention.in_proj_bias)
+        nn.init.xavier_uniform_(self.attention.out_proj.weight)
+        if self.attention.out_proj.bias is not None:
+            nn.init.zeros_(self.attention.out_proj.bias)
+        self.norm.reset_parameters()
+        for module in self.mlp:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        backbone_features: torch.Tensor,
+        backbone_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if backbone_features.ndim != 3:
+            raise ValueError(
+                "backbone_features must have shape [B, sequence, embedding], got "
+                f"{tuple(backbone_features.shape)}"
+            )
+
+        key_padding_mask = None
+        if backbone_attention_mask is not None:
+            if backbone_attention_mask.shape != backbone_features.shape[:2]:
+                raise ValueError(
+                    "backbone_attention_mask must match the first two feature dimensions, got "
+                    f"{tuple(backbone_attention_mask.shape)} vs "
+                    f"{tuple(backbone_features.shape[:2])}"
+                )
+            valid_tokens = backbone_attention_mask.bool()
+            if not torch.all(valid_tokens.any(dim=1)):
+                raise ValueError("Every task-status sample must contain at least one valid token")
+            key_padding_mask = ~valid_tokens
+
+            # Masked backbone positions are not guaranteed to contain finite values.
+            # Replacing them before attention prevents NaNs from leaking through a
+            # subsequent additive attention mask.
+            backbone_features = backbone_features.masked_fill(
+                key_padding_mask.unsqueeze(-1),
+                0,
+            )
+
+        # The backbone is trained under BF16 autocast. Keep the small trainable
+        # status head in its parameter dtype (FP32 for finetuning) because attention
+        # reductions are otherwise the first place non-finite logits can appear.
+        with torch.autocast(device_type=backbone_features.device.type, enabled=False):
+            backbone_features = backbone_features.to(dtype=self.query.dtype)
+            query = self.query.expand(backbone_features.shape[0], -1, -1)
+            pooled, _ = self.attention(
+                query=query,
+                key=backbone_features,
+                value=backbone_features,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+            )
+            logits = self.mlp(self.norm(pooled[:, 0]))
+        if not torch.isfinite(logits).all():
+            raise FloatingPointError(
+                "Task-status head produced non-finite logits; check the source checkpoint "
+                "and backbone features"
+            )
+        return logits
+
+
 class Gr00tN1d7ActionHead(nn.Module):
     """Action head component for flow matching diffusion policy."""
 
@@ -210,9 +322,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         if self.eef_action_encoder is None or self.eef_action_decoder is None:
             raise RuntimeError("Cannot initialize EEF branch in primary-only mode")
         category_id = (
-            self.config.auxiliary_action_init_category
-            if category_id is None
-            else category_id
+            self.config.auxiliary_action_init_category if category_id is None else category_id
         )
         if not 0 <= category_id < self.config.max_num_embodiments:
             raise ValueError(
@@ -506,9 +616,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                     "primary_action_mask shape must match sampled actions, got "
                     f"{tuple(provided_mask.shape)} vs {tuple(primary_action_mask.shape)}"
                 )
-            primary_action_mask = (provided_mask > 0).to(
-                device=device, dtype=vl_embeds.dtype
-            )
+            primary_action_mask = (provided_mask > 0).to(device=device, dtype=vl_embeds.dtype)
             if not torch.count_nonzero(primary_action_mask).item():
                 raise RuntimeError("primary_eef inference mask contains no primary action slots")
         actions = torch.randn_like(primary_action_mask) * primary_action_mask
@@ -722,6 +830,51 @@ class Gr00tN1d7(PreTrainedModel):
 
         # Initialize action head
         self.action_head = Gr00tN1d7ActionHead(config)
+        if config.task_status_head_only and not config.task_status_head_enabled:
+            raise ValueError("task_status_head_only requires task_status_head_enabled=True")
+        if config.task_status_completion_window_frames <= 0:
+            raise ValueError("task_status_completion_window_frames must be positive")
+        if (
+            not math.isfinite(config.task_status_completion_pos_weight)
+            or config.task_status_completion_pos_weight <= 0
+        ):
+            raise ValueError("task_status_completion_pos_weight must be positive")
+        for name in (
+            "task_status_loss_weight",
+            "task_status_completion_loss_weight",
+            "task_status_progress_loss_weight",
+        ):
+            value = getattr(config, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative, got {value}")
+        if (
+            config.task_status_completion_loss_weight == 0
+            and config.task_status_progress_loss_weight == 0
+        ):
+            raise ValueError("At least one task-status objective weight must be positive")
+        for name in (
+            "task_status_completion_threshold",
+            "task_status_progress_threshold",
+        ):
+            value = getattr(config, name)
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be finite and in [0, 1], got {value}")
+        if config.task_status_consecutive_steps <= 0:
+            raise ValueError("task_status_consecutive_steps must be positive")
+        self.task_status_head = None
+        if config.task_status_head_enabled:
+            self.task_status_head = Gr00tTaskStatusHead(
+                embedding_dim=config.backbone_embedding_dim,
+                hidden_dim=config.task_status_hidden_dim,
+                num_heads=config.task_status_num_heads,
+                dropout=config.task_status_dropout,
+            )
+        if config.task_status_head_only:
+            # Enforce the mode at module level as well as through individual tune
+            # flags, so tied or newly-added policy parameters cannot stay trainable.
+            self.backbone.requires_grad_(False)
+            self.action_head.requires_grad_(False)
+            self.task_status_head.requires_grad_(True)
         from .processing_gr00t_n1d7 import Gr00tN1d7DataCollator
 
         self.collator = Gr00tN1d7DataCollator(
@@ -762,7 +915,98 @@ class Gr00tN1d7(PreTrainedModel):
 
         return backbone_inputs, action_inputs
 
-    def forward(self, inputs: dict) -> BatchFeature:
+    def _get_task_status_outputs(
+        self,
+        backbone_outputs: BatchFeature,
+        action_inputs: BatchFeature,
+    ) -> BatchFeature:
+        if self.task_status_head is None:
+            return BatchFeature()
+
+        logits = self.task_status_head(
+            backbone_outputs.backbone_features,
+            backbone_outputs.get("backbone_attention_mask"),
+        )
+        completion_logit = logits[:, 0]
+        progress_logit = logits[:, 1]
+        outputs = BatchFeature(
+            data={
+                "completion_logit": completion_logit,
+                "progress_logit": progress_logit,
+                "completion": torch.sigmoid(completion_logit),
+                "progress": torch.sigmoid(progress_logit),
+            }
+        )
+
+        frame_index = action_inputs.get("frame_index")
+        episode_length = action_inputs.get("episode_length")
+        if frame_index is None or episode_length is None:
+            if self.training:
+                raise ValueError(
+                    "Training with task_status_head_enabled=True requires frame_index "
+                    "and episode_length inputs"
+                )
+            return outputs
+
+        frame_index = frame_index.reshape(-1).to(device=logits.device, dtype=torch.long)
+        episode_length = episode_length.reshape(-1).to(device=logits.device, dtype=torch.long)
+        if (
+            frame_index.shape != completion_logit.shape
+            or episode_length.shape != completion_logit.shape
+        ):
+            raise ValueError(
+                "frame_index and episode_length must contain one value per sample, got "
+                f"{tuple(frame_index.shape)}, {tuple(episode_length.shape)}, and "
+                f"batch {tuple(completion_logit.shape)}"
+            )
+        if torch.any(episode_length <= 0):
+            raise ValueError("episode_length must be positive")
+        if torch.any(frame_index < 0) or torch.any(frame_index >= episode_length):
+            raise ValueError("frame_index must be in [0, episode_length)")
+
+        terminal_window = torch.minimum(
+            torch.full_like(
+                episode_length,
+                self.config.task_status_completion_window_frames,
+            ),
+            episode_length.sub(1).clamp_min(0),
+        )
+        terminal_start = episode_length - terminal_window
+        completion_target = (frame_index >= terminal_start).to(dtype=torch.float32)
+        # The terminal window is a completed hold state: progress reaches one at
+        # its first frame and remains there through the end of the episode.
+        progress_target = (
+            frame_index.to(dtype=torch.float32)
+            / terminal_start.clamp_min(1).to(dtype=torch.float32)
+        ).clamp(max=1.0)
+
+        pos_weight = torch.tensor(
+            self.config.task_status_completion_pos_weight,
+            device=completion_logit.device,
+            dtype=torch.float32,
+        )
+        completion_loss = F.binary_cross_entropy_with_logits(
+            completion_logit.float(),
+            completion_target,
+            pos_weight=pos_weight,
+        )
+        progress_loss = F.smooth_l1_loss(outputs.progress.float(), progress_target)
+        status_loss = (
+            self.config.task_status_completion_loss_weight * completion_loss
+            + self.config.task_status_progress_loss_weight * progress_loss
+        )
+        outputs.update(
+            {
+                "completion_target": completion_target,
+                "progress_target": progress_target,
+                "completion_loss": completion_loss,
+                "progress_loss": progress_loss,
+                "task_status_loss": status_loss,
+            }
+        )
+        return outputs
+
+    def forward(self, inputs: dict) -> dict[str, torch.Tensor]:
         """
         Forward pass through the complete model.
 
@@ -771,12 +1015,32 @@ class Gr00tN1d7(PreTrainedModel):
                 - Action inputs (state, action, embodiment_id, etc.)
 
         Returns:
-            BatchFeature containing loss and other outputs
+            Dictionary containing loss and other outputs. Hugging Face Trainer
+            requires a dictionary (or tuple/ModelOutput) so it can retrieve the
+            loss without treating the result as an integer-indexable sequence.
         """
         # Prepare inputs for backbone and action head
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
+        status_outputs = self._get_task_status_outputs(backbone_outputs, action_inputs)
+
+        if self.config.task_status_head_only:
+            if "task_status_loss" not in status_outputs:
+                raise ValueError(
+                    "Task-status-only training requires frame_index and episode_length inputs"
+                )
+            status_outputs["loss"] = status_outputs.task_status_loss
+            return dict(status_outputs)
+
         action_outputs = self.action_head(backbone_outputs, action_inputs)
+
+        if "task_status_loss" in status_outputs:
+            action_outputs["action_policy_loss"] = action_outputs.loss
+            action_outputs["loss"] = (
+                action_outputs.loss
+                + self.config.task_status_loss_weight * status_outputs.task_status_loss
+            )
+        action_outputs.update(status_outputs)
 
         return action_outputs
 
@@ -789,9 +1053,21 @@ class Gr00tN1d7(PreTrainedModel):
 
         # Forward through backbone
         backbone_outputs = self.backbone(backbone_inputs)
+        status_outputs = self._get_task_status_outputs(backbone_outputs, action_inputs)
         action_outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
+        action_outputs.update(status_outputs)
 
         return action_outputs
+
+    @torch.no_grad()
+    def get_task_status(self, inputs: dict) -> BatchFeature:
+        """Predict completion and progress without running the action diffusion head."""
+        if self.task_status_head is None:
+            raise RuntimeError("This checkpoint does not contain a task-status head")
+
+        backbone_inputs, action_inputs = self.prepare_input(inputs)
+        backbone_outputs = self.backbone(backbone_inputs)
+        return self._get_task_status_outputs(backbone_outputs, action_inputs)
 
     @property
     def device(self):

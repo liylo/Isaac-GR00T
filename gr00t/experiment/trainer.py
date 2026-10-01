@@ -325,6 +325,9 @@ class Gr00tTrainer(Trainer):
             for output_key, log_key in (
                 ("token_loss", "train_token_loss"),
                 ("eef_loss", "train_eef_loss"),
+                ("task_status_loss", "train_task_status_loss"),
+                ("completion_loss", "train_completion_loss"),
+                ("progress_loss", "train_progress_loss"),
             ):
                 task_loss = outputs.get(output_key) if hasattr(outputs, "get") else None
                 if not torch.is_tensor(task_loss):
